@@ -606,6 +606,19 @@ static bool make_dest_mop(mop_t *out, const insn_t &insn, int width = PS_WIDTH)
   return true;
 }
 
+static bool make_dest_mop(mop_t *out, const op_t &op, int width = PS_WIDTH)
+{
+  if ( op.type != o_reg )
+    return false;
+
+  mreg_t mr = reg2mreg(op.reg);
+  if ( mr == mr_none )
+    return false;
+
+  out->make_reg(mr, width);
+  return true;
+}
+
 static mreg_t get_fpr_lane_mreg(const op_t &op, int lane)
 {
   if ( lane < 0 || lane > 1 || op.type != o_reg )
@@ -1249,17 +1262,21 @@ static merror_t emit_ps_sel(codegen_t &cdg)
 
 static merror_t emit_ps_merge(codegen_t &cdg, int dst0_src_opnum, int dst0_src_lane, int dst1_src_opnum, int dst1_src_lane)
 {
-  if ( cdg.insn.Op1.type != o_reg
-    || dst0_src_opnum < 0 || dst0_src_opnum >= UA_MAXOP
+  if ( dst0_src_opnum < 0 || dst0_src_opnum >= UA_MAXOP
     || dst1_src_opnum < 0 || dst1_src_opnum >= UA_MAXOP )
   {
     return MERR_INSN;
   }
 
-  const op_t &src0_op = cdg.insn.ops[dst0_src_opnum];
-  const op_t &src1_op = cdg.insn.ops[dst1_src_opnum];
-  if ( src0_op.type != o_reg || src1_op.type != o_reg )
+  const op_t *regs[3] = {};
+  op_t parsed_regs[3];
+  const char *mnem = cdg.insn.get_canon_mnem(PH);
+  if ( !get_reg_operands_from_insn_or_disasm(cdg.insn, mnem, regs, parsed_regs, 3) )
     return MERR_INSN;
+
+  const op_t &dst_op = *regs[0];
+  const op_t &src0_op = *regs[dst0_src_opnum - 1];
+  const op_t &src1_op = *regs[dst1_src_opnum - 1];
 
   mop_t src0;
   mop_t src1;
@@ -1279,8 +1296,8 @@ static merror_t emit_ps_merge(codegen_t &cdg, int dst0_src_opnum, int dst0_src_l
   emit_float_mov(cdg, src0, tmp0_mop);
   emit_float_mov(cdg, src1, tmp1_mop);
 
-  if ( !emit_float_lane_copy_from_mreg(cdg, cdg.insn.Op1, 0, tmp0)
-    || !emit_float_lane_copy_from_mreg(cdg, cdg.insn.Op1, 1, tmp1) )
+  if ( !emit_float_lane_copy_from_mreg(cdg, dst_op, 0, tmp0)
+    || !emit_float_lane_copy_from_mreg(cdg, dst_op, 1, tmp1) )
   {
     return MERR_INSN;
   }
@@ -1384,20 +1401,39 @@ static merror_t emit_ps_helper(codegen_t &cdg, const char *helper, int first_arg
   tinfo_t ps_type;
   make_ps_type(&ps_type);
 
+  const op_t *regs[4] = {};
+  op_t parsed_regs[4];
+  bool have_regs = get_reg_operands_from_insn_or_disasm(cdg.insn, cdg.insn.get_canon_mnem(PH), regs, parsed_regs, 4);
+
   mcallargs_t args;
   static const char *arg_names[] = { "a", "b", "c", "d", "e", "f", "g" };
   int added = 0;
   for ( int opnum = first_arg_opnum; opnum < UA_MAXOP && added < max_arg_qty; ++opnum )
   {
-    if ( is_void_op(cdg.insn.ops[opnum]) )
-      break;
-    if ( !append_reg_arg(cdg, &args, opnum, ps_type, arg_names[added]) )
-      return MERR_INSN;
+    if ( have_regs )
+    {
+      if ( opnum < 1 || opnum > 4 || regs[opnum - 1] == nullptr )
+        break;
+      if ( !append_fpr_double_mop_arg(&args, *regs[opnum - 1], ps_type, arg_names[added], cdg.insn.ea) )
+        return MERR_INSN;
+    }
+    else
+    {
+      if ( is_void_op(cdg.insn.ops[opnum]) )
+        break;
+      if ( !append_reg_arg(cdg, &args, opnum, ps_type, arg_names[added]) )
+        return MERR_INSN;
+    }
     ++added;
   }
 
   mop_t out;
-  if ( !make_dest_mop(&out, cdg.insn) )
+  if ( have_regs )
+  {
+    if ( !make_dest_mop(&out, *regs[0]) )
+      return MERR_INSN;
+  }
+  else if ( !make_dest_mop(&out, cdg.insn) )
     return MERR_INSN;
 
   return insert_helper_call(cdg, helper, &ps_type, &args, &out);
@@ -1434,19 +1470,24 @@ static merror_t emit_ps_compare_helper(codegen_t &cdg, const char *helper)
 {
   dtype_guard_t guard(cdg.insn);
 
+  const op_t *regs[3] = {};
+  op_t parsed_regs[3];
+  if ( !get_reg_operands_from_insn_or_disasm(cdg.insn, cdg.insn.get_canon_mnem(PH), regs, parsed_regs, 3) )
+    return MERR_INSN;
+
   tinfo_t ps_type;
   tinfo_t int_type;
   make_ps_type(&ps_type);
   make_int_type(&int_type);
 
   mcallargs_t args;
-  if ( !append_reg_arg(cdg, &args, 1, ps_type, "a") )
+  if ( !append_fpr_double_mop_arg(&args, *regs[1], ps_type, "a", cdg.insn.ea) )
     return MERR_INSN;
-  if ( !append_reg_arg(cdg, &args, 2, ps_type, "b") )
+  if ( !append_fpr_double_mop_arg(&args, *regs[2], ps_type, "b", cdg.insn.ea) )
     return MERR_INSN;
 
   mop_t out;
-  if ( !make_dest_mop(&out, cdg.insn, inf_get_cc_size_i()) )
+  if ( !make_dest_mop(&out, *regs[0], inf_get_cc_size_i()) )
     return MERR_INSN;
 
   return insert_helper_call(cdg, helper, &int_type, &args, &out);
