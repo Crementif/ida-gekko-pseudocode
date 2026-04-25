@@ -20,7 +20,6 @@ constexpr int PS_WIDTH = 8;
 constexpr int PS_LANE_WIDTH = 4;
 constexpr const char *PS_TYPE_NAME = "ppc_ps_t";
 constexpr const char *ALWAYS_FIX_ACTION_NAME = "ppc_ps_hexrays:always_fix";
-constexpr const char *FIX_FUNCTION_ACTION_NAME = "ppc_ps_hexrays:fix_function";
 constexpr const char *REG_SUBKEY = "ppc_ps_hexrays";
 constexpr const char *REG_ALWAYS_FIX = "always_fix_paired_singles";
 
@@ -1767,57 +1766,6 @@ static const char *ps_helper_name_from_mnem(const insn_t &insn, int *max_arg_qty
   return nullptr;
 }
 
-static bool is_safe_early_lowered_insn(const insn_t &insn)
-{
-  switch ( insn.itype )
-  {
-    case PPC_fsel:
-      return true;
-
-    case PPC_psq_l:
-    case PPC_psq_st:
-      return (is_unquantized_pair_access(insn) || is_scalar_plus_one_pair_access(insn))
-          && insn.Op1.type == o_reg
-          && insn.Op2.type == o_displ;
-
-    case PPC_ps_add:
-    case PPC_ps_sub:
-    case PPC_ps_mul:
-    case PPC_ps_div:
-    case PPC_ps_muls0:
-    case PPC_ps_muls1:
-    case PPC_ps_madd:
-    case PPC_ps_msub:
-    case PPC_ps_nmadd:
-    case PPC_ps_nmsub:
-    case PPC_ps_madds0:
-    case PPC_ps_madds1:
-    case PPC_ps_neg:
-    case PPC_ps_abs:
-    case PPC_ps_nabs:
-    case PPC_ps_mr:
-    case PPC_ps_merge00:
-    case PPC_ps_merge01:
-    case PPC_ps_merge10:
-    case PPC_ps_merge11:
-    case PPC_ps_res:
-    case PPC_ps_rsqrte:
-    case PPC_ps_sel:
-    case PPC_ps_sum0:
-    case PPC_ps_sum1:
-      return true;
-
-    default:
-      return decode_raw_fsel_a_form(nullptr, insn) == RAW_FSEL
-          || decode_raw_ps_a_form(nullptr, insn) != RAW_PS_NONE
-          || is_fsel_mnemonic(insn)
-          || ps_helper_name_from_mnem(insn, nullptr) != nullptr
-          || is_ps_sum0_mnemonic(insn)
-          || is_ps_sum1_mnemonic(insn)
-          || is_ps_sel_mnemonic(insn);
-  }
-}
-
 static const cexpr_t *skip_casts(const cexpr_t *e)
 {
   while ( e != nullptr && e->op == cot_cast )
@@ -2319,7 +2267,7 @@ struct ppc_ps_filter_t : public microcode_filter_t
   {
     const bool full_fix_enabled = gate == nullptr || gate->should_fix_ea(cdg.insn.ea);
     if ( !full_fix_enabled )
-      return is_safe_early_lowered_insn(cdg.insn);
+      return false;
 
     int first_arg = 0;
     int max_arg_qty = 0;
@@ -2337,13 +2285,12 @@ struct ppc_ps_filter_t : public microcode_filter_t
   merror_t apply(codegen_t &cdg) override
   {
     const bool full_fix_enabled = gate == nullptr || gate->should_fix_ea(cdg.insn.ea);
-    const bool safe_early = is_safe_early_lowered_insn(cdg.insn);
-    if ( !full_fix_enabled && !safe_early )
+    if ( !full_fix_enabled )
       return MERR_INSN;
 
     auto early_or_helper = [&](merror_t err, const char *helper, int max_arg_qty) -> merror_t
     {
-      if ( err == MERR_OK || !full_fix_enabled )
+      if ( err == MERR_OK )
         return err;
       return emit_ps_helper(cdg, helper, 1, max_arg_qty);
     };
@@ -2514,20 +2461,10 @@ struct always_fix_ah_t : public action_handler_t
   action_state_t idaapi update(action_update_ctx_t *uctx) override;
 };
 
-struct fix_function_ah_t : public action_handler_t
-{
-  plugin_ctx_t *ctx = nullptr;
-
-  int idaapi activate(action_activation_ctx_t *actx) override;
-  action_state_t idaapi update(action_update_ctx_t *uctx) override;
-};
-
 struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_micro_t, public function_gate_t
 {
   ppc_ps_filter_t filter;
   always_fix_ah_t always_fix_ah;
-  fix_function_ah_t fix_function_ah;
-  qvector<ea_t> session_fixed_functions;
   bool always_fix = false;
 
   static ea_t function_start_for_ea(ea_t ea)
@@ -2536,28 +2473,14 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
     return func != nullptr ? func->start_ea : BADADDR;
   }
 
-  bool is_session_fixed(ea_t func_ea) const
-  {
-    for ( ea_t ea : session_fixed_functions )
-      if ( ea == func_ea )
-        return true;
-    return false;
-  }
-
   bool should_fix_function(ea_t func_ea) const
   {
-    return func_ea != BADADDR && (always_fix || is_session_fixed(func_ea));
+    return func_ea != BADADDR && always_fix;
   }
 
   bool should_fix_ea(ea_t ea) const override
   {
     return should_fix_function(function_start_for_ea(ea));
-  }
-
-  void add_session_fixed_function(ea_t func_ea)
-  {
-    if ( func_ea != BADADDR && !is_session_fixed(func_ea) )
-      session_fixed_functions.push_back(func_ea);
   }
 
   void refresh_function(vdui_t *vu, ea_t func_ea)
@@ -2585,21 +2508,6 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
     refresh_function(vu, func_ea);
   }
 
-  bool fix_current_pseudocode_function(vdui_t *vu)
-  {
-    if ( vu == nullptr || vu->cfunc == nullptr )
-    {
-      warning("ppc_ps_hexrays: use this from a pseudocode function");
-      return false;
-    }
-
-    ea_t func_ea = vu->cfunc->entry_ea;
-    add_session_fixed_function(func_ea);
-    refresh_function(vu, func_ea);
-    msg("ppc_ps_hexrays: enabled paired-single fixes for %a this session\n", func_ea);
-    return true;
-  }
-
   static ssize_t idaapi hr_callback(void *ud, hexrays_event_t event, va_list va)
   {
     plugin_ctx_t *ctx = static_cast<plugin_ctx_t *>(ud);
@@ -2621,7 +2529,6 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
       if ( vu != nullptr )
       {
         attach_action_to_popup(widget, popup_handle, ALWAYS_FIX_ACTION_NAME, nullptr, SETMENU_APP);
-        attach_action_to_popup(widget, popup_handle, FIX_FUNCTION_ACTION_NAME, nullptr, SETMENU_APP);
       }
     }
     return 0;
@@ -2632,7 +2539,6 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
     always_fix = reg_read_bool(REG_ALWAYS_FIX, false, REG_SUBKEY);
     filter.gate = this;
     always_fix_ah.ctx = this;
-    fix_function_ah.ctx = this;
 
     init_ignore_micro();
     hook_event_listener(HT_IDP, this);
@@ -2648,21 +2554,12 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
                             -1,
                             ADF_OT_PLUGMOD | ADF_CHECKABLE));
     update_action_checked(ALWAYS_FIX_ACTION_NAME, always_fix);
-    register_action(ACTION_DESC_LITERAL_PLUGMOD(
-                            FIX_FUNCTION_ACTION_NAME,
-                            "Fix Paired Single Instructions",
-                            &fix_function_ah,
-                            this,
-                            nullptr,
-                            "Apply paired-single fixes to this function for the current session",
-                            -1));
     msg("ppc_ps_hexrays: installed optional PowerPC paired-single Hex-Rays filter%s\n",
         always_fix ? " (automatic fixes enabled)" : "");
   }
 
   ~plugin_ctx_t() override
   {
-    unregister_action(FIX_FUNCTION_ACTION_NAME);
     unregister_action(ALWAYS_FIX_ACTION_NAME);
     remove_hexrays_callback(hr_callback, this);
     unhook_event_listener(HT_IDP, this);
@@ -2706,21 +2603,6 @@ action_state_t idaapi always_fix_ah_t::update(action_update_ctx_t *uctx)
     return AST_DISABLE_FOR_WIDGET;
 
   update_action_checked(ALWAYS_FIX_ACTION_NAME, ctx->always_fix);
-  return AST_ENABLE_FOR_WIDGET;
-}
-
-int idaapi fix_function_ah_t::activate(action_activation_ctx_t *actx)
-{
-  if ( ctx == nullptr || actx == nullptr )
-    return 0;
-
-  return ctx->fix_current_pseudocode_function(get_widget_vdui(actx->widget)) ? 1 : 0;
-}
-
-action_state_t idaapi fix_function_ah_t::update(action_update_ctx_t *uctx)
-{
-  if ( ctx == nullptr || uctx == nullptr || uctx->widget_type != BWN_PSEUDOCODE )
-    return AST_DISABLE_FOR_WIDGET;
   return AST_ENABLE_FOR_WIDGET;
 }
 
