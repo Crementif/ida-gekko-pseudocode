@@ -1,0 +1,11 @@
+{
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "ppc_ps_hexrays",
+    "entryPoint": "ppc_ps_hexrays",
+    "categories": ["decompilation"],
+    "idaVersions": ">=9.3",
+    "description": "Hex-Rays microcode support for Wii U PowerPC paired-single instructions.",
+    "version": "0.1.0"
+  }
+}
