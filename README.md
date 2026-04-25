@@ -1,10 +1,19 @@
-# ppc_ps_hexrays
+# PowerPC paired-single plugin for IDA's Pseudocode
 
-Hex-Rays plugin for IDA 9.3 that improves Wii U PowerPC paired-single decompilation.
+This IDA plugin (currently targetting IDA 9.3) makes various improvements to the paired single floating point instructions support inside the decompiled pseudocode in IDA.
 
-The plugin targets instructions that IDA can disassemble but Hex-Rays often leaves as inline `__asm`, especially `psq_l`/`psq_st` stack traffic and common `ps_*` arithmetic.
+Although IDA supports instructions like e.g. `psq_l`, `psq_st`, these will show up as inline assembly statements `` inside the pseudocode, usually interleaved with normal floating point code.
+Other times, the pseudocode would get confused and assume that the function setup happened much earlier and misplace the start of the body's function, which leads to be bad code generation.
 
-It also marks Wii U paired-single callee-save prologue patterns as prologue code, including interleaved `mflr`/LR stores and `stfd` + `ps_merge10` + `stfs` saves for nonvolatile FPR paired-single lanes.
+Both of these issues make it quite hard to look through floating point heavy code in GameCube, Wii and Wii U games or executables.
+That is what led me to creating this plugin, albeit with a healthy dose of AI coding. So use it or don't if the latter isn't your thing.
+
+## Preview
+
+| Before | After |
+|---|---|
+| ![Before small](images/before_small.png) | ![After small](images/after_small.png) |
+| ![Before big](images/before_big.png) | ![After big](images/after_big.png) |
 
 ## Build
 
@@ -26,46 +35,23 @@ The SDK CMake support deploys the plugin below `${IDABIN}/plugins/ppc_ps_hexrays
 
 ## Current Coverage
 
-Memory instructions are handled first because they affect stack-variable recovery:
+Coverage is focused on the Wii U paired-single patterns that most affect decompilation quality.
 
-- Displacement-based `psq_l`, `psq_st` with `I=0` are emitted early for the common exact forms used by Wii U code: `W=0` as two 4-byte float lane loads/stores, and `W=1` as a lane-0 float transfer plus the architectural lane-1 `1.0f` value. This improves Hex-Rays variable recognition before lvar allocation.
-- Non-displacement or quantized `psq_l`, `psq_st` forms still use explicit helpers, avoiding unsafe reinterpretation when exact lane memory semantics are not emitted.
-- Other `psq_*` forms are converted to explicit helper calls so they no longer appear as raw inline assembly.
+- Exact displacement `psq_l` and `psq_st` forms are lowered early during microcode generation when `I=0`.
+- `W=0` is emitted as two 32-bit float lane loads/stores, and `W=1` is emitted as a lane-0 float transfer plus the architectural lane-1 `1.0f` value.
+- This early lowering happens before lvar allocation, which improves stack-variable recovery and lets Hex-Rays optimize away unused lanes like normal scalar float code.
+- Quantized forms and non-displacement or indexed `psq_*` variants are not reinterpreted as exact memory traffic. They stay as typed helpers such as `__ppc_psq_l`, `__ppc_psq_st`, `__ppc_psq_lx`, or `__ppc_psq_stux` until there is enough reason to model their full GQR-dependent semantics.
 
-Function prologue handling covers Wii U paired-single save sequences:
+- Wii U paired-single callee-save prologues are recognized and marked as prologue code.
+- This includes `stfd fN, slot(r1)` + `ps_merge10 fN, fN, fN` + `stfs fN, slot+8(r1)` save sequences, as well as delayed `mflr rX` + `stw rX, sender_lr(r1)` patterns that belong to the same save block.
+- Marking these as prologue keeps Hex-Rays from attaching save/setup instructions to the first real body block.
 
-- `stfd fN, slot(r1)` + `ps_merge10 fN, fN, fN` + `stfs fN, slot+8(r1)` is treated as a callee-save sequence rather than body code.
-- Delayed `mflr rX` + `stw rX, sender_lr(r1)` inside the same save block is marked as prologue so Hex-Rays does not attach the LR save to the first real branch/body block.
+- The plugin lowers many common paired-single operations directly to lane-wise float microcode or per-lane scalar helpers: `ps_add`, `ps_sub`, `ps_mul`, `ps_div`, `ps_muls0`, `ps_muls1`, `ps_madd`, `ps_msub`, `ps_nmadd`, `ps_nmsub`, `ps_madds0`, `ps_madds1`, `ps_neg`, `ps_abs`, `ps_nabs`, `ps_mr`, `ps_merge00`, `ps_merge01`, `ps_merge10`, `ps_merge11`, `ps_sum0`, `ps_sum1`, `ps_res`, `ps_rsqrte`, and `ps_sel`.
+- `ps_sum0` and `ps_sum1` are handled early, with an older scalar-use heuristic still available as a fallback when direct emission is not possible.
+- Scalar PowerPC `fsel` is also handled and emitted as `__ppc_fsel(test, ge_zero, lt_zero)` with the expected PowerPC `test >= 0 ? ge_zero : lt_zero` behavior.
 
-Common paired-single operations are lowered early to scalar float microcode or per-lane scalar helper calls where possible:
+- Compare operations `ps_cmpu0`, `ps_cmpu1`, `ps_cmpo0`, and `ps_cmpo1` are emitted as typed helpers.
+- Any paired-single operation that is recognized but not safely lowered still becomes a typed helper call instead of raw inline assembly, which preserves dataflow without pretending paired-single values are scalar doubles.
 
-- `ps_add`, `ps_sub`, `ps_mul`, `ps_div`
-- `ps_muls0`, `ps_muls1`
-- `ps_madd`, `ps_msub`, `ps_nmadd`, `ps_nmsub`
-- `ps_madds0`, `ps_madds1`
-- `ps_neg`, `ps_mr`
-- `ps_abs`, `ps_nabs`
-- `ps_merge00`, `ps_merge01`, `ps_merge10`, `ps_merge11`
-- `ps_sum0`, `ps_sum1`
-- `ps_res`, `ps_rsqrte`
-- `ps_sel`
-
-Remaining paired-single operations are converted to typed helper calls:
-
-- compare helpers `ps_cmpu0`, `ps_cmpu1`, `ps_cmpo0`, `ps_cmpo1`
-
-Exact scalar lane lowering runs during initial microcode generation, even when the optional per-function ctree cleanup is not enabled. This lets the decompiler's normal optimizer delete unused lanes and recover ordinary float locals before final pseudocode is built. Remaining whole-pair helper calls preserve register dataflow for operations that are not yet lowered without pretending paired-single vectors are scalar doubles.
-
-The plugin installs a named `ppc_ps_t` typedef for paired-single values. This keeps helper signatures and propagated casts shorter than Hex-Rays' anonymous `struct { float ps0; float ps1; }` fallback, especially for expressions that reinterpret adjacent `float` fields as one paired-single value.
-
-Simple paired-single helper assignments to adjacent float fields are still simplified back into lane-wise float operations as a fallback cleanup when whole-pair helpers survive to ctree. This fallback now also reconstructs `ps_madd`/`ps_msub`/`ps_nmadd`/`ps_nmsub`, `ps_madds0`/`ps_madds1`, and `psq_l(..., 1, 0)` lane materialization, so matrix/vector helpers decompile more cleanly even when a whole-pair helper remains.
-
-`ps_sum0`/`ps_sum1` are lowered early to scalar lane operations. The older scalar-use heuristic remains as a fallback for cases that cannot be emitted directly.
-
-Scalar PowerPC floating-point select is also handled:
-
-- `fsel` becomes `__ppc_fsel(test, ge_zero, lt_zero)`, matching PowerPC semantics: return `ge_zero` when `test >= 0`, otherwise `lt_zero`.
-
-## Notes
-
-The first-pass implementation intentionally only treats unquantized `psq_l/st W=0,I=0` as exact memory operations. Quantized forms require GQR-aware conversion semantics and are kept as helpers until real samples need them.
+- The plugin installs a named `ppc_ps_t` typedef so helper signatures and propagated casts stay readable.
+- A final ctree cleanup can rewrite simple whole-pair helper assignments back into adjacent float-lane expressions, including common `ps_madd`/`ps_msub` families and `psq_l(..., 1, 0)` lane materialization, so surviving helper-based output still decompiles more cleanly.
