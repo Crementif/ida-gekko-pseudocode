@@ -17,6 +17,7 @@ namespace
 {
 
 constexpr int PS_WIDTH = 8;
+constexpr int PS_LANE_WIDTH = 4;
 constexpr const char *PS_TYPE_NAME = "ppc_ps_t";
 constexpr const char *ALWAYS_FIX_ACTION_NAME = "ppc_ps_hexrays:always_fix";
 constexpr const char *FIX_FUNCTION_ACTION_NAME = "ppc_ps_hexrays:fix_function";
@@ -43,6 +44,24 @@ struct dtype_guard_t
   {
     for ( int n = 0; n < UA_MAXOP; ++n )
       insn.ops[n].dtype = old_dtypes[n];
+  }
+};
+
+struct insn_ops_guard_t
+{
+  insn_t &insn;
+  op_t old_ops[UA_MAXOP];
+
+  explicit insn_ops_guard_t(insn_t &i) : insn(i)
+  {
+    for ( int n = 0; n < UA_MAXOP; ++n )
+      old_ops[n] = insn.ops[n];
+  }
+
+  ~insn_ops_guard_t()
+  {
+    for ( int n = 0; n < UA_MAXOP; ++n )
+      insn.ops[n] = old_ops[n];
   }
 };
 
@@ -497,6 +516,250 @@ static bool make_dest_mop(mop_t *out, const insn_t &insn, int width = PS_WIDTH)
   return true;
 }
 
+static mreg_t get_fpr_lane_mreg(const op_t &op, int lane)
+{
+  if ( lane < 0 || lane > 1 || op.type != o_reg )
+    return mr_none;
+
+  mreg_t mr = reg2mreg(op.reg);
+  if ( mr == mr_none )
+    return mr_none;
+  return mr + lane * PS_LANE_WIDTH;
+}
+
+static bool make_fpr_lane_mop(mop_t *out, const op_t &op, int lane)
+{
+  mreg_t mr = get_fpr_lane_mreg(op, lane);
+  if ( mr == mr_none )
+    return false;
+
+  out->make_reg(mr, PS_LANE_WIDTH);
+  return true;
+}
+
+static bool set_pair_mem_lane(insn_t *insn, int opnum, int lane)
+{
+  if ( lane < 0 || lane > 1 || opnum < 0 || opnum >= UA_MAXOP )
+    return false;
+
+  op_t &op = insn->ops[opnum];
+  if ( op.type != o_displ )
+    return false;
+
+  op.dtype = dt_float;
+  op.addr += lane * PS_LANE_WIDTH;
+  return true;
+}
+
+static void mark_float_insn(minsn_t *ins)
+{
+  if ( ins != nullptr )
+    ins->set_fpinsn();
+}
+
+static bool emit_float_insn(codegen_t &cdg, mcode_t opcode, const mop_t &lhs, const mop_t *rhs, const mop_t &dst)
+{
+  mark_float_insn(cdg.emit(opcode, &lhs, rhs, &dst));
+  return true;
+}
+
+static bool emit_float_mov(codegen_t &cdg, const mop_t &src, const mop_t &dst)
+{
+  return emit_float_insn(cdg, m_mov, src, nullptr, dst);
+}
+
+static bool emit_float_unary_lane(codegen_t &cdg, mcode_t opcode, const op_t &dst_op, const op_t &src_op, int lane)
+{
+  mop_t src;
+  mop_t dst;
+  if ( !make_fpr_lane_mop(&src, src_op, lane) || !make_fpr_lane_mop(&dst, dst_op, lane) )
+    return false;
+  return emit_float_insn(cdg, opcode, src, nullptr, dst);
+}
+
+static bool emit_float_binary_lane(
+        codegen_t &cdg,
+        mcode_t opcode,
+        const op_t &dst_op,
+        const op_t &lhs_op,
+        int lhs_lane,
+        const op_t &rhs_op,
+        int rhs_lane,
+        int dst_lane)
+{
+  mop_t lhs;
+  mop_t rhs;
+  mop_t dst;
+  if ( !make_fpr_lane_mop(&lhs, lhs_op, lhs_lane)
+    || !make_fpr_lane_mop(&rhs, rhs_op, rhs_lane)
+    || !make_fpr_lane_mop(&dst, dst_op, dst_lane) )
+  {
+    return false;
+  }
+  return emit_float_insn(cdg, opcode, lhs, &rhs, dst);
+}
+
+static bool emit_float_lane_copy(codegen_t &cdg, const op_t &dst_op, int dst_lane, const op_t &src_op, int src_lane)
+{
+  mop_t src;
+  mop_t dst;
+  if ( !make_fpr_lane_mop(&src, src_op, src_lane) || !make_fpr_lane_mop(&dst, dst_op, dst_lane) )
+    return false;
+  return emit_float_mov(cdg, src, dst);
+}
+
+static bool emit_float_lane_copy_from_mreg(codegen_t &cdg, const op_t &dst_op, int dst_lane, mreg_t src_mr)
+{
+  if ( src_mr == mr_none )
+    return false;
+
+  mop_t src(src_mr, PS_LANE_WIDTH);
+  mop_t dst;
+  if ( !make_fpr_lane_mop(&dst, dst_op, dst_lane) )
+    return false;
+  return emit_float_mov(cdg, src, dst);
+}
+
+static bool pair_mem_lane_load(codegen_t &cdg, int opnum, int lane, mreg_t *out)
+{
+  insn_ops_guard_t guard(cdg.insn);
+  if ( !set_pair_mem_lane(&cdg.insn, opnum, lane) )
+    return false;
+
+  mreg_t loaded = cdg.load_operand(opnum);
+  if ( loaded == mr_none )
+    return false;
+
+  *out = loaded;
+  return true;
+}
+
+static bool pair_mem_lane_store(codegen_t &cdg, int opnum, int lane, const mop_t &src)
+{
+  insn_ops_guard_t guard(cdg.insn);
+  if ( !set_pair_mem_lane(&cdg.insn, opnum, lane) )
+    return false;
+
+  minsn_t *outins = nullptr;
+  if ( !cdg.store_operand(opnum, src, 0, &outins) )
+    return false;
+  mark_float_insn(outins);
+  return true;
+}
+
+static merror_t emit_ps_lanewise_binary(codegen_t &cdg, mcode_t opcode)
+{
+  if ( cdg.insn.Op1.type != o_reg || cdg.insn.Op2.type != o_reg || cdg.insn.Op3.type != o_reg )
+    return MERR_INSN;
+
+  if ( !emit_float_binary_lane(cdg, opcode, cdg.insn.Op1, cdg.insn.Op2, 0, cdg.insn.Op3, 0, 0)
+    || !emit_float_binary_lane(cdg, opcode, cdg.insn.Op1, cdg.insn.Op2, 1, cdg.insn.Op3, 1, 1) )
+  {
+    return MERR_INSN;
+  }
+  return MERR_OK;
+}
+
+static merror_t emit_ps_lanewise_unary(codegen_t &cdg, mcode_t opcode)
+{
+  if ( cdg.insn.Op1.type != o_reg || cdg.insn.Op2.type != o_reg )
+    return MERR_INSN;
+
+  if ( !emit_float_unary_lane(cdg, opcode, cdg.insn.Op1, cdg.insn.Op2, 0)
+    || !emit_float_unary_lane(cdg, opcode, cdg.insn.Op1, cdg.insn.Op2, 1) )
+  {
+    return MERR_INSN;
+  }
+  return MERR_OK;
+}
+
+static merror_t emit_ps_mr(codegen_t &cdg)
+{
+  if ( cdg.insn.Op1.type != o_reg || cdg.insn.Op2.type != o_reg )
+    return MERR_INSN;
+
+  if ( !emit_float_lane_copy(cdg, cdg.insn.Op1, 0, cdg.insn.Op2, 0)
+    || !emit_float_lane_copy(cdg, cdg.insn.Op1, 1, cdg.insn.Op2, 1) )
+  {
+    return MERR_INSN;
+  }
+  return MERR_OK;
+}
+
+static merror_t emit_ps_muls_lane(codegen_t &cdg, int scalar_lane)
+{
+  if ( scalar_lane < 0 || scalar_lane > 1
+    || cdg.insn.Op1.type != o_reg
+    || cdg.insn.Op2.type != o_reg
+    || cdg.insn.Op3.type != o_reg )
+  {
+    return MERR_INSN;
+  }
+
+  mop_t scale_src;
+  if ( !make_fpr_lane_mop(&scale_src, cdg.insn.Op3, scalar_lane) )
+    return MERR_INSN;
+
+  mreg_t scale_tmp = cdg.mba->alloc_kreg(PS_LANE_WIDTH);
+  if ( scale_tmp == mr_none )
+    return MERR_INSN;
+
+  mop_t scale(scale_tmp, PS_LANE_WIDTH);
+  emit_float_mov(cdg, scale_src, scale);
+  for ( int lane = 0; lane < 2; ++lane )
+  {
+    mop_t lhs;
+    mop_t dst;
+    if ( !make_fpr_lane_mop(&lhs, cdg.insn.Op2, lane)
+      || !make_fpr_lane_mop(&dst, cdg.insn.Op1, lane)
+      || !emit_float_insn(cdg, m_fmul, lhs, &scale, dst) )
+    {
+      return MERR_INSN;
+    }
+  }
+  return MERR_OK;
+}
+
+static merror_t emit_ps_merge(codegen_t &cdg, int dst0_src_opnum, int dst0_src_lane, int dst1_src_opnum, int dst1_src_lane)
+{
+  if ( cdg.insn.Op1.type != o_reg
+    || dst0_src_opnum < 0 || dst0_src_opnum >= UA_MAXOP
+    || dst1_src_opnum < 0 || dst1_src_opnum >= UA_MAXOP )
+  {
+    return MERR_INSN;
+  }
+
+  const op_t &src0_op = cdg.insn.ops[dst0_src_opnum];
+  const op_t &src1_op = cdg.insn.ops[dst1_src_opnum];
+  if ( src0_op.type != o_reg || src1_op.type != o_reg )
+    return MERR_INSN;
+
+  mop_t src0;
+  mop_t src1;
+  if ( !make_fpr_lane_mop(&src0, src0_op, dst0_src_lane)
+    || !make_fpr_lane_mop(&src1, src1_op, dst1_src_lane) )
+  {
+    return MERR_INSN;
+  }
+
+  mreg_t tmp0 = cdg.mba->alloc_kreg(PS_LANE_WIDTH);
+  mreg_t tmp1 = cdg.mba->alloc_kreg(PS_LANE_WIDTH);
+  if ( tmp0 == mr_none || tmp1 == mr_none )
+    return MERR_INSN;
+
+  mop_t tmp0_mop(tmp0, PS_LANE_WIDTH);
+  mop_t tmp1_mop(tmp1, PS_LANE_WIDTH);
+  emit_float_mov(cdg, src0, tmp0_mop);
+  emit_float_mov(cdg, src1, tmp1_mop);
+
+  if ( !emit_float_lane_copy_from_mreg(cdg, cdg.insn.Op1, 0, tmp0)
+    || !emit_float_lane_copy_from_mreg(cdg, cdg.insn.Op1, 1, tmp1) )
+  {
+    return MERR_INSN;
+  }
+  return MERR_OK;
+}
+
 static merror_t insert_helper_call(codegen_t &cdg, const char *helper, const tinfo_t *ret_type, const mcallargs_t *args, const mop_t *out)
 {
   minsn_t *call = cdg.mba->create_helper_call(cdg.insn.ea, helper, ret_type, args, out);
@@ -509,30 +772,48 @@ static merror_t insert_helper_call(codegen_t &cdg, const char *helper, const tin
 
 static merror_t emit_psq_load(codegen_t &cdg)
 {
-  dtype_guard_t guard(cdg.insn);
-
-  if ( !is_unquantized_pair_access(cdg.insn) || !is_stack_operand(cdg.insn, 1) )
+  if ( !is_unquantized_pair_access(cdg.insn)
+    || cdg.insn.Op1.type != o_reg
+    || cdg.insn.Op2.type != o_displ )
+  {
     return MERR_INSN;
+  }
 
-  mreg_t loaded = load_operand_as_ps(cdg, 1);
-  if ( loaded == mr_none )
-    return MERR_INSN;
+  for ( int lane = 0; lane < 2; ++lane )
+  {
+    mreg_t loaded = mr_none;
+    mop_t dst;
+    if ( !pair_mem_lane_load(cdg, 1, lane, &loaded)
+      || !make_fpr_lane_mop(&dst, cdg.insn.Op1, lane) )
+    {
+      return MERR_INSN;
+    }
 
-  return store_operand_as_ps(cdg, 0, loaded) ? MERR_OK : MERR_INSN;
+    mop_t src(loaded, PS_LANE_WIDTH);
+    emit_float_mov(cdg, src, dst);
+  }
+  return MERR_OK;
 }
 
 static merror_t emit_psq_store(codegen_t &cdg)
 {
-  dtype_guard_t guard(cdg.insn);
-
-  if ( !is_unquantized_pair_access(cdg.insn) || !is_stack_operand(cdg.insn, 1) )
+  if ( !is_unquantized_pair_access(cdg.insn)
+    || cdg.insn.Op1.type != o_reg
+    || cdg.insn.Op2.type != o_displ )
+  {
     return MERR_INSN;
+  }
 
-  mreg_t value = load_operand_as_ps(cdg, 0);
-  if ( value == mr_none )
-    return MERR_INSN;
-
-  return store_operand_as_ps(cdg, 1, value) ? MERR_OK : MERR_INSN;
+  for ( int lane = 0; lane < 2; ++lane )
+  {
+    mop_t src;
+    if ( !make_fpr_lane_mop(&src, cdg.insn.Op1, lane)
+      || !pair_mem_lane_store(cdg, 1, lane, src) )
+    {
+      return MERR_INSN;
+    }
+  }
+  return MERR_OK;
 }
 
 static merror_t emit_ps_helper(codegen_t &cdg, const char *helper, int first_arg_opnum, int max_arg_qty)
@@ -1319,8 +1600,18 @@ struct ppc_ps_filter_t : public microcode_filter_t
       case PPC_ps_cmpo0: return emit_ps_compare_helper(cdg, "__ppc_ps_cmpo0");
       case PPC_ps_cmpo1: return emit_ps_compare_helper(cdg, "__ppc_ps_cmpo1");
 
-      case PPC_ps_sub:
-        return emit_ps_helper(cdg, "__ppc_ps_sub", 1, 2);
+      case PPC_ps_add: return emit_ps_lanewise_binary(cdg, m_fadd);
+      case PPC_ps_sub: return emit_ps_lanewise_binary(cdg, m_fsub);
+      case PPC_ps_mul: return emit_ps_lanewise_binary(cdg, m_fmul);
+      case PPC_ps_div: return emit_ps_lanewise_binary(cdg, m_fdiv);
+      case PPC_ps_muls0: return emit_ps_muls_lane(cdg, 0);
+      case PPC_ps_muls1: return emit_ps_muls_lane(cdg, 1);
+      case PPC_ps_neg: return emit_ps_lanewise_unary(cdg, m_fneg);
+      case PPC_ps_mr: return emit_ps_mr(cdg);
+      case PPC_ps_merge00: return emit_ps_merge(cdg, 2, 0, 3, 0);
+      case PPC_ps_merge01: return emit_ps_merge(cdg, 2, 0, 3, 1);
+      case PPC_ps_merge10: return emit_ps_merge(cdg, 2, 1, 3, 0);
+      case PPC_ps_merge11: return emit_ps_merge(cdg, 2, 1, 3, 1);
 
       default:
         int first_arg = 1;

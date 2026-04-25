@@ -28,8 +28,8 @@ The SDK CMake support deploys the plugin below `${IDABIN}/plugins/ppc_ps_hexrays
 
 Memory instructions are handled first because they affect stack-variable recovery:
 
-- Stack-based `psq_l`, `psq_st` with `W=0, I=0` are emitted as real 8-byte microcode loads/stores.
-- Non-stack `psq_l`, `psq_st` use explicit helpers even for `W=0, I=0`, which keeps structure-field accesses from being reinterpreted through `double *`/`COERCE_PPC_PS_T(...)` in pseudocode.
+- Unquantized displacement-based `psq_l`, `psq_st` with `W=0, I=0` are emitted early as two 4-byte float lane loads/stores, improving Hex-Rays variable recognition before lvar allocation.
+- Non-displacement or quantized `psq_l`, `psq_st` forms still use explicit helpers, avoiding unsafe reinterpretation when exact lane memory semantics are not emitted.
 - Other `psq_*` forms are converted to explicit helper calls so they no longer appear as raw inline assembly.
 
 Function prologue handling covers Wii U paired-single save sequences:
@@ -37,19 +37,23 @@ Function prologue handling covers Wii U paired-single save sequences:
 - `stfd fN, slot(r1)` + `ps_merge10 fN, fN, fN` + `stfs fN, slot+8(r1)` is treated as a callee-save sequence rather than body code.
 - Delayed `mflr rX` + `stw rX, sender_lr(r1)` inside the same save block is marked as prologue so Hex-Rays does not attach the LR save to the first real branch/body block.
 
-Common paired-single arithmetic is converted to typed helper calls:
+Common lane-wise paired-single operations are lowered early to scalar float microcode where possible:
 
 - `ps_add`, `ps_sub`, `ps_mul`, `ps_div`
 - `ps_muls0`, `ps_muls1`
+- `ps_neg`, `ps_mr`
+- `ps_merge00`, `ps_merge01`, `ps_merge10`, `ps_merge11`
+
+Remaining paired-single operations are converted to typed helper calls:
+
 - `ps_madd`, `ps_msub`, `ps_nmadd`, `ps_nmsub`
 - `ps_madds0`, `ps_madds1`
-- `ps_neg`, `ps_abs`, `ps_nabs`, `ps_mr`
-- `ps_merge00`, `ps_merge01`, `ps_merge10`, `ps_merge11`
+- `ps_abs`, `ps_nabs`
 - vector sum helpers `ps_sum0`, `ps_sum1`
 - reciprocal estimate helpers `ps_res`, `ps_rsqrte`
 - compare helpers `ps_cmpu0`, `ps_cmpu1`, `ps_cmpo0`, `ps_cmpo1`
 
-The helper calls preserve register dataflow without pretending paired-single vectors are scalar doubles.
+The scalar lane lowering lets the decompiler's normal optimizer delete unused lanes and recover ordinary float locals before final pseudocode is built. The helper calls preserve register dataflow for operations that are not yet lowered without pretending paired-single vectors are scalar doubles.
 
 The plugin installs a named `ppc_ps_t` typedef for paired-single values. This keeps helper signatures and propagated casts shorter than Hex-Rays' anonymous `struct { float ps0; float ps1; }` fallback, especially for expressions that reinterpret adjacent `float` fields as one paired-single value.
 
