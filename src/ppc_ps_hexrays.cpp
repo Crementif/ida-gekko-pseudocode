@@ -29,6 +29,23 @@ struct function_gate_t
   virtual bool should_fix_ea(ea_t ea) const = 0;
 };
 
+enum raw_ps_kind_t
+{
+  RAW_PS_NONE,
+  RAW_PS_SUM0,
+  RAW_PS_SUM1,
+  RAW_PS_SEL,
+  RAW_FSEL,
+};
+
+struct raw_ps_operands_t
+{
+  op_t dst;
+  op_t a;
+  op_t b;
+  op_t c;
+};
+
 struct dtype_guard_t
 {
   insn_t &insn;
@@ -87,6 +104,14 @@ static bool is_unquantized_pair_access(const insn_t &insn)
   return is_imm_value(insn.Op3, 0) && is_imm_value(insn.Op4, 0);
 }
 
+static bool is_scalar_plus_one_pair_access(const insn_t &insn)
+{
+  // psq_l/st with W=1,I=0 transfers lane 0 and uses the architectural
+  // single-element encoding for lane 1. Wii U affine matrix helpers commonly
+  // rely on this form for xyz + implicit w=1 vectors.
+  return is_imm_value(insn.Op3, 1) && is_imm_value(insn.Op4, 0);
+}
+
 static bool is_stack_operand(const insn_t &insn, int opnum)
 {
   if ( opnum < 0 || opnum >= UA_MAXOP )
@@ -98,30 +123,92 @@ static bool is_paired_single_itype(uint16 itype);
 static const char *ps_helper_name(uint16 itype, int *first_arg, int *max_arg_qty);
 static bool is_control_flow_boundary(const insn_t &insn, uint32 feature);
 
-static bool has_canon_mnem(const insn_t &insn, const char *mnem)
+static bool mnem_matches(const char *text, const char *mnem)
 {
-  const char *canon = insn.get_canon_mnem(PH);
-  if ( canon == nullptr || mnem == nullptr )
+  if ( text == nullptr || mnem == nullptr )
     return false;
 
+  while ( qisspace(*text) )
+    ++text;
+
   size_t len = qstrlen(mnem);
-  return qstrncmp(canon, mnem, len) == 0
-      && (canon[len] == '\0' || canon[len] == '.');
+  return strnicmp(text, mnem, len) == 0
+      && (text[len] == '\0' || text[len] == '.' || qisspace(text[len]));
+}
+
+static const char *find_mnem_token(const char *text, const char *mnem)
+{
+  if ( text == nullptr || mnem == nullptr )
+    return nullptr;
+
+  const size_t len = qstrlen(mnem);
+  for ( const char *p = stristr(text, mnem); p != nullptr; p = stristr(p + 1, mnem) )
+  {
+    const char prev = p == text ? '\0' : p[-1];
+    const char next = p[len];
+    const bool before_ok = prev == '\0' || qisspace(prev) || prev == ':' || prev == ';';
+    const bool after_ok = next == '\0' || next == '.' || qisspace(next);
+    if ( before_ok && after_ok )
+      return p;
+  }
+  return nullptr;
+}
+
+static bool get_disasm_line(qstring *out, ea_t ea)
+{
+  qstring line;
+  if ( generate_disasm_line(&line, ea, GENDSM_FORCE_CODE | GENDSM_REMOVE_TAGS) )
+  {
+    *out = line;
+    return true;
+  }
+
+  if ( !print_insn_mnem(&line, ea) )
+    return false;
+
+  tag_remove(out, line.c_str());
+  return true;
+}
+
+static bool has_mnem(const insn_t &insn, const char *mnem)
+{
+  const char *canon = insn.get_canon_mnem(PH);
+  if ( mnem_matches(canon, mnem) )
+    return true;
+
+  qstring printed;
+  if ( !print_insn_mnem(&printed, insn.ea) )
+    return false;
+
+  qstring plain;
+  tag_remove(&plain, printed.c_str());
+  if ( mnem_matches(plain.c_str(), mnem) || find_mnem_token(plain.c_str(), mnem) != nullptr )
+    return true;
+
+  qstring line;
+  if ( !get_disasm_line(&line, insn.ea) )
+    return false;
+  return mnem_matches(line.c_str(), mnem) || find_mnem_token(line.c_str(), mnem) != nullptr;
 }
 
 static bool is_fsel_mnemonic(const insn_t &insn)
 {
-  return has_canon_mnem(insn, "fsel");
+  return has_mnem(insn, "fsel");
 }
 
 static bool is_ps_sum0_mnemonic(const insn_t &insn)
 {
-  return has_canon_mnem(insn, "ps_sum0");
+  return has_mnem(insn, "ps_sum0");
 }
 
 static bool is_ps_sum1_mnemonic(const insn_t &insn)
 {
-  return has_canon_mnem(insn, "ps_sum1");
+  return has_mnem(insn, "ps_sum1");
+}
+
+static bool is_ps_sel_mnemonic(const insn_t &insn)
+{
+  return has_mnem(insn, "ps_sel");
 }
 
 static mreg_t load_operand_as_ps(codegen_t &cdg, int opnum)
@@ -537,6 +624,135 @@ static bool make_fpr_lane_mop(mop_t *out, const op_t &op, int lane)
   return true;
 }
 
+static bool collect_reg_operands(const insn_t &insn, const op_t **out, int count)
+{
+  int found = 0;
+  for ( int opnum = 0; opnum < UA_MAXOP && found < count; ++opnum )
+  {
+    if ( insn.ops[opnum].type == o_reg )
+      out[found++] = &insn.ops[opnum];
+  }
+  return found == count;
+}
+
+static bool make_fpr_op(op_t *out, int fpr)
+{
+  if ( fpr < 0 || fpr > 31 )
+    return false;
+
+  qstring regname;
+  regname.sprnt("f%d", fpr);
+  int reg = str2reg(regname.c_str());
+  if ( reg < 0 )
+  {
+    regname.sprnt("fr%d", fpr);
+    reg = str2reg(regname.c_str());
+  }
+  if ( reg < 0 )
+    return false;
+
+  *out = op_t();
+  out->type = o_reg;
+  out->reg = uint16(reg);
+  out->dtype = dt_float;
+  return true;
+}
+
+static raw_ps_kind_t decode_raw_ps_a_form(raw_ps_operands_t *out, const insn_t &insn)
+{
+  const uint32 word = get_dword(insn.ea);
+  if ( (word >> 26) != 4 )
+    return RAW_PS_NONE;
+
+  raw_ps_kind_t kind = RAW_PS_NONE;
+  switch ( (word >> 1) & 0x1F )
+  {
+    case 10: kind = RAW_PS_SUM0; break;
+    case 11: kind = RAW_PS_SUM1; break;
+    case 23: kind = RAW_PS_SEL; break;
+    default: return RAW_PS_NONE;
+  }
+
+  if ( out == nullptr )
+    return kind;
+
+  if ( !make_fpr_op(&out->dst, int((word >> 21) & 0x1F))
+    || !make_fpr_op(&out->a, int((word >> 16) & 0x1F))
+    || !make_fpr_op(&out->b, int((word >> 11) & 0x1F))
+    || !make_fpr_op(&out->c, int((word >> 6) & 0x1F)) )
+  {
+    return RAW_PS_NONE;
+  }
+
+  return kind;
+}
+
+static raw_ps_kind_t decode_raw_fsel_a_form(raw_ps_operands_t *out, const insn_t &insn)
+{
+  const uint32 word = get_dword(insn.ea);
+  if ( (word >> 26) != 63 || ((word >> 1) & 0x1F) != 23 )
+    return RAW_PS_NONE;
+
+  if ( out == nullptr )
+    return RAW_FSEL;
+
+  if ( !make_fpr_op(&out->dst, int((word >> 21) & 0x1F))
+    || !make_fpr_op(&out->a, int((word >> 16) & 0x1F))
+    || !make_fpr_op(&out->b, int((word >> 11) & 0x1F))
+    || !make_fpr_op(&out->c, int((word >> 6) & 0x1F)) )
+  {
+    return RAW_PS_NONE;
+  }
+
+  return RAW_FSEL;
+}
+
+static bool parse_fpr_operands_from_disasm(const insn_t &insn, const char *mnem, op_t *out, int count)
+{
+  qstring line;
+  if ( !get_disasm_line(&line, insn.ea) )
+    return false;
+
+  const char *p = find_mnem_token(line.c_str(), mnem);
+  if ( p == nullptr )
+    return false;
+  p += qstrlen(mnem);
+
+  int found = 0;
+  while ( *p != '\0' && found < count )
+  {
+    while ( *p != '\0' && *p != 'f' && *p != 'F' )
+      ++p;
+    if ( *p == '\0' )
+      break;
+
+    const char *digits = p + 1;
+    if ( !qisdigit(*digits) )
+    {
+      ++p;
+      continue;
+    }
+
+    int fpr = 0;
+    while ( qisdigit(*digits) )
+    {
+      fpr = fpr * 10 + (*digits - '0');
+      ++digits;
+    }
+    if ( fpr < 0 || fpr > 31 )
+    {
+      p = digits;
+      continue;
+    }
+
+    if ( !make_fpr_op(&out[found], fpr) )
+      return false;
+    ++found;
+    p = digits;
+  }
+  return found == count;
+}
+
 static bool set_pair_mem_lane(insn_t *insn, int opnum, int lane)
 {
   if ( lane < 0 || lane > 1 || opnum < 0 || opnum >= UA_MAXOP )
@@ -566,6 +782,11 @@ static bool emit_float_insn(codegen_t &cdg, mcode_t opcode, const mop_t &lhs, co
 static bool emit_float_mov(codegen_t &cdg, const mop_t &src, const mop_t &dst)
 {
   return emit_float_insn(cdg, m_mov, src, nullptr, dst);
+}
+
+static bool make_float_constant_mop(mop_t *out, float value)
+{
+  return out->make_fpnum(&value, sizeof(value));
 }
 
 static bool emit_float_unary_lane(codegen_t &cdg, mcode_t opcode, const op_t &dst_op, const op_t &src_op, int lane)
@@ -618,6 +839,108 @@ static bool emit_float_lane_copy_from_mreg(codegen_t &cdg, const op_t &dst_op, i
   if ( !make_fpr_lane_mop(&dst, dst_op, dst_lane) )
     return false;
   return emit_float_mov(cdg, src, dst);
+}
+
+static bool append_fpr_lane_arg(
+        mcallargs_t *args,
+        const op_t &op,
+        int lane,
+        const tinfo_t &type,
+        const char *name,
+        ea_t ea)
+{
+  mop_t mop;
+  if ( !make_fpr_lane_mop(&mop, op, lane) )
+    return false;
+  return append_mop_arg(args, mop, type, name, ea);
+}
+
+static bool emit_float_helper_call(codegen_t &cdg, const char *helper, const mcallargs_t &args, const mop_t &out)
+{
+  tinfo_t fp_type = get_fp_tinfo(dt_float);
+  minsn_t *call = cdg.mba->create_helper_call(cdg.insn.ea, helper, &fp_type, &args, &out);
+  if ( call == nullptr )
+    return false;
+
+  cdg.mb->insert_into_block(call, cdg.mb->tail);
+  return true;
+}
+
+static bool emit_float_unary_helper_lane(codegen_t &cdg, const char *helper, const op_t &dst_op, const op_t &src_op, int lane)
+{
+  tinfo_t fp_type = get_fp_tinfo(dt_float);
+  mcallargs_t args;
+  mop_t dst;
+  if ( !append_fpr_lane_arg(&args, src_op, lane, fp_type, "x", cdg.insn.ea)
+    || !make_fpr_lane_mop(&dst, dst_op, lane) )
+  {
+    return false;
+  }
+  return emit_float_helper_call(cdg, helper, args, dst);
+}
+
+static bool emit_float_ternary_helper_lane(
+        codegen_t &cdg,
+        const char *helper,
+        const op_t &dst_op,
+        const op_t &arg0_op,
+        const op_t &arg1_op,
+        const op_t &arg2_op,
+        int lane)
+{
+  tinfo_t fp_type = get_fp_tinfo(dt_float);
+  mcallargs_t args;
+  mop_t dst;
+  if ( !append_fpr_lane_arg(&args, arg0_op, lane, fp_type, "test", cdg.insn.ea)
+    || !append_fpr_lane_arg(&args, arg1_op, lane, fp_type, "ge_zero", cdg.insn.ea)
+    || !append_fpr_lane_arg(&args, arg2_op, lane, fp_type, "lt_zero", cdg.insn.ea)
+    || !make_fpr_lane_mop(&dst, dst_op, lane) )
+  {
+    return false;
+  }
+  return emit_float_helper_call(cdg, helper, args, dst);
+}
+
+static merror_t insert_helper_call(codegen_t &cdg, const char *helper, const tinfo_t *ret_type, const mcallargs_t *args, const mop_t *out);
+
+static bool append_fpr_double_mop_arg(
+        mcallargs_t *args,
+        const op_t &op,
+        const tinfo_t &type,
+        const char *name,
+        ea_t ea)
+{
+  if ( op.type != o_reg )
+    return false;
+
+  mreg_t mr = reg2mreg(op.reg);
+  if ( mr == mr_none )
+    return false;
+
+  mop_t mop(mr, PS_WIDTH);
+  return append_mop_arg(args, mop, type, name, ea);
+}
+
+static merror_t emit_fsel_ops(codegen_t &cdg, const op_t &dst_op, const op_t &test_op, const op_t &ge_zero_op, const op_t &lt_zero_op)
+{
+  tinfo_t fp_type = get_fp_tinfo(dt_double);
+  mcallargs_t args;
+  if ( !append_fpr_double_mop_arg(&args, test_op, fp_type, "test", cdg.insn.ea)
+    || !append_fpr_double_mop_arg(&args, ge_zero_op, fp_type, "ge_zero", cdg.insn.ea)
+    || !append_fpr_double_mop_arg(&args, lt_zero_op, fp_type, "lt_zero", cdg.insn.ea) )
+  {
+    return MERR_INSN;
+  }
+
+  if ( dst_op.type != o_reg )
+    return MERR_INSN;
+
+  mreg_t dst_mr = reg2mreg(dst_op.reg);
+  if ( dst_mr == mr_none )
+    return MERR_INSN;
+
+  mop_t out(dst_mr, PS_WIDTH);
+  return insert_helper_call(cdg, "__ppc_fsel", &fp_type, &args, &out);
 }
 
 static bool pair_mem_lane_load(codegen_t &cdg, int opnum, int lane, mreg_t *out)
@@ -700,6 +1023,17 @@ static merror_t emit_ps_muls_lane(codegen_t &cdg, int scalar_lane)
   if ( !make_fpr_lane_mop(&scale_src, cdg.insn.Op3, scalar_lane) )
     return MERR_INSN;
 
+  for ( int lane = 0; lane < 2; ++lane )
+  {
+    mop_t lhs;
+    mop_t dst;
+    if ( !make_fpr_lane_mop(&lhs, cdg.insn.Op2, lane)
+      || !make_fpr_lane_mop(&dst, cdg.insn.Op1, lane) )
+    {
+      return MERR_INSN;
+    }
+  }
+
   mreg_t scale_tmp = cdg.mba->alloc_kreg(PS_LANE_WIDTH);
   if ( scale_tmp == mr_none )
     return MERR_INSN;
@@ -718,6 +1052,169 @@ static merror_t emit_ps_muls_lane(codegen_t &cdg, int scalar_lane)
     }
   }
   return MERR_OK;
+}
+
+static merror_t emit_ps_madd_like(codegen_t &cdg, bool subtract, bool negate, int scalar_multiplier_lane)
+{
+  if ( scalar_multiplier_lane < -1 || scalar_multiplier_lane > 1
+    || cdg.insn.Op1.type != o_reg
+    || cdg.insn.Op2.type != o_reg
+    || cdg.insn.Op3.type != o_reg
+    || cdg.insn.Op4.type != o_reg )
+  {
+    return MERR_INSN;
+  }
+
+  mop_t scalar_multiplier;
+  if ( scalar_multiplier_lane >= 0 )
+  {
+    mop_t scalar_src;
+    if ( !make_fpr_lane_mop(&scalar_src, cdg.insn.Op3, scalar_multiplier_lane) )
+      return MERR_INSN;
+
+    mreg_t scalar_tmp = cdg.mba->alloc_kreg(PS_LANE_WIDTH);
+    if ( scalar_tmp == mr_none )
+      return MERR_INSN;
+
+    scalar_multiplier.make_reg(scalar_tmp, PS_LANE_WIDTH);
+  }
+
+  for ( int lane = 0; lane < 2; ++lane )
+  {
+    mop_t lhs;
+    mop_t rhs;
+    mop_t addend;
+    mop_t dst;
+    if ( !make_fpr_lane_mop(&lhs, cdg.insn.Op2, lane)
+      || !make_fpr_lane_mop(&addend, cdg.insn.Op4, lane)
+      || !make_fpr_lane_mop(&dst, cdg.insn.Op1, lane) )
+    {
+      return MERR_INSN;
+    }
+    if ( scalar_multiplier_lane < 0 && !make_fpr_lane_mop(&rhs, cdg.insn.Op3, lane) )
+      return MERR_INSN;
+  }
+
+  mreg_t product_tmp = cdg.mba->alloc_kreg(PS_LANE_WIDTH);
+  if ( product_tmp == mr_none )
+    return MERR_INSN;
+
+  if ( scalar_multiplier_lane >= 0 )
+  {
+    mop_t scalar_src;
+    if ( !make_fpr_lane_mop(&scalar_src, cdg.insn.Op3, scalar_multiplier_lane) )
+      return MERR_INSN;
+    emit_float_mov(cdg, scalar_src, scalar_multiplier);
+  }
+
+  mop_t product(product_tmp, PS_LANE_WIDTH);
+  for ( int lane = 0; lane < 2; ++lane )
+  {
+    mop_t lhs;
+    mop_t rhs;
+    mop_t addend;
+    mop_t dst;
+    if ( !make_fpr_lane_mop(&lhs, cdg.insn.Op2, lane)
+      || !make_fpr_lane_mop(&addend, cdg.insn.Op4, lane)
+      || !make_fpr_lane_mop(&dst, cdg.insn.Op1, lane) )
+    {
+      return MERR_INSN;
+    }
+
+    if ( scalar_multiplier_lane >= 0 )
+      rhs = scalar_multiplier;
+    else if ( !make_fpr_lane_mop(&rhs, cdg.insn.Op3, lane) )
+      return MERR_INSN;
+
+    if ( !emit_float_insn(cdg, m_fmul, lhs, &rhs, product)
+      || !emit_float_insn(cdg, subtract ? m_fsub : m_fadd, product, &addend, dst) )
+    {
+      return MERR_INSN;
+    }
+    if ( negate && !emit_float_insn(cdg, m_fneg, dst, nullptr, dst) )
+      return MERR_INSN;
+  }
+  return MERR_OK;
+}
+
+static merror_t emit_ps_sum_ops(codegen_t &cdg, const op_t &dst_op, const op_t &a_op, const op_t &b_op, const op_t &c_op, bool sum0)
+{
+  const int sum_dst_lane = sum0 ? 0 : 1;
+  const int copy_dst_lane = sum0 ? 1 : 0;
+  const int copy_src_lane = sum0 ? 1 : 0;
+  mop_t sum_lhs;
+  mop_t sum_rhs;
+  mop_t sum_dst;
+  mop_t copy_src;
+  mop_t copy_dst;
+  if ( !make_fpr_lane_mop(&sum_lhs, a_op, 0)
+    || !make_fpr_lane_mop(&sum_rhs, b_op, 1)
+    || !make_fpr_lane_mop(&sum_dst, dst_op, sum_dst_lane)
+    || !make_fpr_lane_mop(&copy_src, c_op, copy_src_lane)
+    || !make_fpr_lane_mop(&copy_dst, dst_op, copy_dst_lane) )
+  {
+    return MERR_INSN;
+  }
+
+  if ( !emit_float_insn(cdg, m_fadd, sum_lhs, &sum_rhs, sum_dst)
+    || !emit_float_mov(cdg, copy_src, copy_dst) )
+  {
+    return MERR_INSN;
+  }
+  return MERR_OK;
+}
+
+static merror_t emit_ps_sum(codegen_t &cdg, bool sum0)
+{
+  const op_t *regs[4] = {};
+  op_t parsed_regs[4];
+  if ( !collect_reg_operands(cdg.insn, regs, 4) )
+  {
+    if ( !parse_fpr_operands_from_disasm(cdg.insn, sum0 ? "ps_sum0" : "ps_sum1", parsed_regs, 4) )
+      return MERR_INSN;
+    for ( int i = 0; i < 4; ++i )
+      regs[i] = &parsed_regs[i];
+  }
+
+  return emit_ps_sum_ops(cdg, *regs[0], *regs[1], *regs[2], *regs[3], sum0);
+}
+
+static merror_t emit_ps_unary_helper(codegen_t &cdg, const char *helper, bool negate_result=false)
+{
+  if ( cdg.insn.Op1.type != o_reg || cdg.insn.Op2.type != o_reg )
+    return MERR_INSN;
+
+  for ( int lane = 0; lane < 2; ++lane )
+  {
+    if ( !emit_float_unary_helper_lane(cdg, helper, cdg.insn.Op1, cdg.insn.Op2, lane) )
+      return MERR_INSN;
+    if ( negate_result && !emit_float_unary_lane(cdg, m_fneg, cdg.insn.Op1, cdg.insn.Op1, lane) )
+      return MERR_INSN;
+  }
+  return MERR_OK;
+}
+
+static merror_t emit_ps_sel_ops(codegen_t &cdg, const op_t &dst_op, const op_t &test_op, const op_t &ge_zero_op, const op_t &lt_zero_op)
+{
+  for ( int lane = 0; lane < 2; ++lane )
+    if ( !emit_float_ternary_helper_lane(cdg, "__ppc_ps_sel_scalar", dst_op, test_op, ge_zero_op, lt_zero_op, lane) )
+      return MERR_INSN;
+  return MERR_OK;
+}
+
+static merror_t emit_ps_sel(codegen_t &cdg)
+{
+  const op_t *regs[4] = {};
+  op_t parsed_regs[4];
+  if ( !collect_reg_operands(cdg.insn, regs, 4) )
+  {
+    if ( !parse_fpr_operands_from_disasm(cdg.insn, "ps_sel", parsed_regs, 4) )
+      return MERR_INSN;
+    for ( int i = 0; i < 4; ++i )
+      regs[i] = &parsed_regs[i];
+  }
+
+  return emit_ps_sel_ops(cdg, *regs[0], *regs[1], *regs[2], *regs[3]);
 }
 
 static merror_t emit_ps_merge(codegen_t &cdg, int dst0_src_opnum, int dst0_src_lane, int dst1_src_opnum, int dst1_src_lane)
@@ -772,47 +1269,81 @@ static merror_t insert_helper_call(codegen_t &cdg, const char *helper, const tin
 
 static merror_t emit_psq_load(codegen_t &cdg)
 {
-  if ( !is_unquantized_pair_access(cdg.insn)
-    || cdg.insn.Op1.type != o_reg
-    || cdg.insn.Op2.type != o_displ )
+  if ( cdg.insn.Op1.type != o_reg || cdg.insn.Op2.type != o_displ )
   {
     return MERR_INSN;
   }
 
-  for ( int lane = 0; lane < 2; ++lane )
+  if ( is_unquantized_pair_access(cdg.insn) )
   {
-    mreg_t loaded = mr_none;
-    mop_t dst;
-    if ( !pair_mem_lane_load(cdg, 1, lane, &loaded)
-      || !make_fpr_lane_mop(&dst, cdg.insn.Op1, lane) )
+    for ( int lane = 0; lane < 2; ++lane )
     {
-      return MERR_INSN;
-    }
+      mreg_t loaded = mr_none;
+      mop_t dst;
+      if ( !pair_mem_lane_load(cdg, 1, lane, &loaded)
+        || !make_fpr_lane_mop(&dst, cdg.insn.Op1, lane) )
+      {
+        return MERR_INSN;
+      }
 
-    mop_t src(loaded, PS_LANE_WIDTH);
-    emit_float_mov(cdg, src, dst);
+      mop_t src(loaded, PS_LANE_WIDTH);
+      emit_float_mov(cdg, src, dst);
+    }
+    return MERR_OK;
   }
+
+  if ( !is_scalar_plus_one_pair_access(cdg.insn) )
+    return MERR_INSN;
+
+  mreg_t loaded = mr_none;
+  mop_t dst0;
+  mop_t dst1;
+  mop_t one;
+  if ( !pair_mem_lane_load(cdg, 1, 0, &loaded)
+    || !make_fpr_lane_mop(&dst0, cdg.insn.Op1, 0)
+    || !make_fpr_lane_mop(&dst1, cdg.insn.Op1, 1)
+    || !make_float_constant_mop(&one, 1.0f) )
+  {
+    return MERR_INSN;
+  }
+
+  mop_t src0(loaded, PS_LANE_WIDTH);
+  emit_float_mov(cdg, src0, dst0);
+  emit_float_mov(cdg, one, dst1);
   return MERR_OK;
 }
 
 static merror_t emit_psq_store(codegen_t &cdg)
 {
-  if ( !is_unquantized_pair_access(cdg.insn)
-    || cdg.insn.Op1.type != o_reg
-    || cdg.insn.Op2.type != o_displ )
+  if ( cdg.insn.Op1.type != o_reg || cdg.insn.Op2.type != o_displ )
   {
     return MERR_INSN;
   }
 
-  for ( int lane = 0; lane < 2; ++lane )
+  if ( is_unquantized_pair_access(cdg.insn) )
   {
-    mop_t src;
-    if ( !make_fpr_lane_mop(&src, cdg.insn.Op1, lane)
-      || !pair_mem_lane_store(cdg, 1, lane, src) )
+    for ( int lane = 0; lane < 2; ++lane )
     {
-      return MERR_INSN;
+      mop_t src;
+      if ( !make_fpr_lane_mop(&src, cdg.insn.Op1, lane)
+        || !pair_mem_lane_store(cdg, 1, lane, src) )
+      {
+        return MERR_INSN;
+      }
     }
+    return MERR_OK;
   }
+
+  if ( !is_scalar_plus_one_pair_access(cdg.insn) )
+    return MERR_INSN;
+
+  mop_t src;
+  if ( !make_fpr_lane_mop(&src, cdg.insn.Op1, 0)
+    || !pair_mem_lane_store(cdg, 1, 0, src) )
+  {
+    return MERR_INSN;
+  }
+
   return MERR_OK;
 }
 
@@ -975,6 +1506,16 @@ static bool should_scalarize_ps_result(const insn_t &insn, op_dtype_t *out_dtype
 
 static merror_t emit_fsel_helper(codegen_t &cdg)
 {
+  const op_t *regs[4] = {};
+  op_t parsed_regs[4];
+  raw_ps_operands_t raw_ops;
+  if ( collect_reg_operands(cdg.insn, regs, 4) )
+    return emit_fsel_ops(cdg, *regs[0], *regs[1], *regs[2], *regs[3]);
+  if ( parse_fpr_operands_from_disasm(cdg.insn, "fsel", parsed_regs, 4) )
+    return emit_fsel_ops(cdg, parsed_regs[0], parsed_regs[1], parsed_regs[2], parsed_regs[3]);
+  if ( decode_raw_fsel_a_form(&raw_ops, cdg.insn) == RAW_FSEL )
+    return emit_fsel_ops(cdg, raw_ops.dst, raw_ops.a, raw_ops.b, raw_ops.c);
+
   dtype_guard_t guard(cdg.insn);
 
   tinfo_t fp_type = get_fp_tinfo(dt_double);
@@ -1097,6 +1638,56 @@ static const char *ps_helper_name(uint16 itype, int *first_arg, int *max_arg_qty
     case PPC_ps_cmpo0:   *max_arg_qty = 2; return "__ppc_ps_cmpo0";
     case PPC_ps_cmpo1:   *max_arg_qty = 2; return "__ppc_ps_cmpo1";
     default: return nullptr;
+  }
+}
+
+static bool is_safe_early_lowered_insn(const insn_t &insn)
+{
+  switch ( insn.itype )
+  {
+    case PPC_fsel:
+      return true;
+
+    case PPC_psq_l:
+    case PPC_psq_st:
+      return is_unquantized_pair_access(insn)
+          && insn.Op1.type == o_reg
+          && insn.Op2.type == o_displ;
+
+    case PPC_ps_add:
+    case PPC_ps_sub:
+    case PPC_ps_mul:
+    case PPC_ps_div:
+    case PPC_ps_muls0:
+    case PPC_ps_muls1:
+    case PPC_ps_madd:
+    case PPC_ps_msub:
+    case PPC_ps_nmadd:
+    case PPC_ps_nmsub:
+    case PPC_ps_madds0:
+    case PPC_ps_madds1:
+    case PPC_ps_neg:
+    case PPC_ps_abs:
+    case PPC_ps_nabs:
+    case PPC_ps_mr:
+    case PPC_ps_merge00:
+    case PPC_ps_merge01:
+    case PPC_ps_merge10:
+    case PPC_ps_merge11:
+    case PPC_ps_res:
+    case PPC_ps_rsqrte:
+    case PPC_ps_sel:
+    case PPC_ps_sum0:
+    case PPC_ps_sum1:
+      return true;
+
+    default:
+      return decode_raw_fsel_a_form(nullptr, insn) == RAW_FSEL
+          || decode_raw_ps_a_form(nullptr, insn) != RAW_PS_NONE
+          || is_fsel_mnemonic(insn)
+          || is_ps_sum0_mnemonic(insn)
+          || is_ps_sum1_mnemonic(insn)
+          || is_ps_sel_mnemonic(insn);
   }
 }
 
@@ -1315,20 +1906,37 @@ static cexpr_t *build_float_expr_from_ea_value(const cexpr_t *ea_expr, uint32 by
   return lane;
 }
 
+static cexpr_t *make_float_const_expr(float value, ea_t ea);
+
 static cexpr_t *build_psq_load_lane_expr(const cexpr_t *expr, int lane)
 {
   expr = match_helper_call(expr, "__ppc_psq_l");
   if ( expr == nullptr || expr->a == nullptr || expr->a->size() < 3 )
     return nullptr;
 
-  if ( !is_zero_expr(&(*expr->a)[1]) || !is_zero_expr(&(*expr->a)[2]) )
+  if ( is_zero_expr(&(*expr->a)[1]) && is_zero_expr(&(*expr->a)[2]) )
+  {
+    const uint32 byte_off = uint32(lane * 4);
+    const cexpr_t *ea_arg = &(*expr->a)[0];
+    if ( const cexpr_t *base = extract_address_base(ea_arg) )
+      return build_float_expr_at_address(base, byte_off);
+    return build_float_expr_from_ea_value(ea_arg, byte_off);
+  }
+
+  if ( !is_zero_expr(&(*expr->a)[2]) )
     return nullptr;
 
-  const uint32 byte_off = uint32(lane * 4);
+  const cexpr_t *w_arg = skip_casts(&(*expr->a)[1]);
+  if ( w_arg == nullptr || !w_arg->is_const_value(1) )
+    return nullptr;
+
+  if ( lane == 1 )
+    return make_float_const_expr(1.0f, expr->ea);
+
   const cexpr_t *ea_arg = &(*expr->a)[0];
   if ( const cexpr_t *base = extract_address_base(ea_arg) )
-    return build_float_expr_at_address(base, byte_off);
-  return build_float_expr_from_ea_value(ea_arg, byte_off);
+    return build_float_expr_at_address(base, 0);
+  return build_float_expr_from_ea_value(ea_arg, 0);
 }
 
 static cexpr_t *make_float_binary_expr(ctype_t op, cexpr_t *lhs, cexpr_t *rhs, ea_t ea)
@@ -1357,6 +1965,22 @@ static cexpr_t *make_float_assign(cexpr_t *dst, cexpr_t *value, ea_t ea)
   asg->type = dst->type;
   asg->calc_type(true);
   return asg;
+}
+
+static cexpr_t *make_float_const_expr(float value, ea_t ea)
+{
+  fpvalue_t fpval;
+  if ( fpval.from_float(value) != REAL_ERROR_OK )
+    return nullptr;
+
+  cexpr_t *expr = new cexpr_t();
+  expr->op = cot_fnum;
+  expr->ea = ea;
+  expr->type = get_fp_tinfo(dt_float);
+  expr->fpc = new fnumber_t();
+  expr->fpc->fnum = fpval;
+  expr->fpc->nbytes = sizeof(value);
+  return expr;
 }
 
 static cexpr_t *build_ps_lane_expr(const cexpr_t *expr, int lane);
@@ -1461,6 +2085,40 @@ static cexpr_t *build_ps_lane_expr(const cexpr_t *expr, int lane)
     return make_float_binary_expr(cot_fmul, lhs, rhs, expr->ea);
   }
 
+  auto madd_like = [&](bool subtract, bool negate, int scalar_lane) -> cexpr_t *
+  {
+    if ( nargs != 3 )
+      return nullptr;
+
+    cexpr_t *lhs = arg_lane(0, lane);
+    cexpr_t *rhs = scalar_lane >= 0 ? arg_lane(1, scalar_lane) : arg_lane(1, lane);
+    cexpr_t *addend = arg_lane(2, lane);
+    if ( lhs == nullptr || rhs == nullptr || addend == nullptr )
+    {
+      delete lhs;
+      delete rhs;
+      delete addend;
+      return nullptr;
+    }
+
+    cexpr_t *product = make_float_binary_expr(cot_fmul, lhs, rhs, expr->ea);
+    cexpr_t *sum = make_float_binary_expr(subtract ? cot_fsub : cot_fadd, product, addend, expr->ea);
+    return negate ? make_float_unary_expr(cot_fneg, sum, expr->ea) : sum;
+  };
+
+  if ( strcmp(helper, "__ppc_ps_madd") == 0 )
+    return madd_like(false, false, -1);
+  if ( strcmp(helper, "__ppc_ps_msub") == 0 )
+    return madd_like(true, false, -1);
+  if ( strcmp(helper, "__ppc_ps_nmadd") == 0 )
+    return madd_like(false, true, -1);
+  if ( strcmp(helper, "__ppc_ps_nmsub") == 0 )
+    return madd_like(true, true, -1);
+  if ( strcmp(helper, "__ppc_ps_madds0") == 0 )
+    return madd_like(false, false, 0);
+  if ( strcmp(helper, "__ppc_ps_madds1") == 0 )
+    return madd_like(false, false, 1);
+
   if ( strcmp(helper, "__ppc_ps_merge00") == 0 && nargs == 2 )
     return arg_lane(lane, 0);
   if ( strcmp(helper, "__ppc_ps_merge01") == 0 && nargs == 2 )
@@ -1532,8 +2190,9 @@ struct ppc_ps_filter_t : public microcode_filter_t
 
   bool match(codegen_t &cdg) override
   {
-    if ( gate != nullptr && !gate->should_fix_ea(cdg.insn.ea) )
-      return false;
+    const bool full_fix_enabled = gate == nullptr || gate->should_fix_ea(cdg.insn.ea);
+    if ( !full_fix_enabled )
+      return is_safe_early_lowered_insn(cdg.insn);
 
     int first_arg = 0;
     int max_arg_qty = 0;
@@ -1542,20 +2201,53 @@ struct ppc_ps_filter_t : public microcode_filter_t
         || is_fsel_mnemonic(cdg.insn)
         || is_ps_sum0_mnemonic(cdg.insn)
         || is_ps_sum1_mnemonic(cdg.insn)
+        || is_ps_sel_mnemonic(cdg.insn)
         || is_psq_itype(cdg.insn.itype)
         || ps_helper_name(cdg.insn.itype, &first_arg, &max_arg_qty) != nullptr;
   }
 
   merror_t apply(codegen_t &cdg) override
   {
-    if ( is_wiiu_save_prolog_insn(cdg.insn) )
+    const bool full_fix_enabled = gate == nullptr || gate->should_fix_ea(cdg.insn.ea);
+    const bool safe_early = is_safe_early_lowered_insn(cdg.insn);
+    if ( !full_fix_enabled && !safe_early )
+      return MERR_INSN;
+
+    auto early_or_helper = [&](merror_t err, const char *helper, int max_arg_qty) -> merror_t
+    {
+      if ( err == MERR_OK || !full_fix_enabled )
+        return err;
+      return emit_ps_helper(cdg, helper, 1, max_arg_qty);
+    };
+
+    if ( full_fix_enabled && is_wiiu_save_prolog_insn(cdg.insn) )
       return MERR_OK;
 
-    if ( cdg.insn.itype == PPC_fsel || is_fsel_mnemonic(cdg.insn) )
+    if ( cdg.insn.itype == PPC_fsel
+      || decode_raw_fsel_a_form(nullptr, cdg.insn) == RAW_FSEL
+      || is_fsel_mnemonic(cdg.insn) )
+    {
       return emit_fsel_helper(cdg);
+    }
+
+    raw_ps_operands_t raw_ops;
+    raw_ps_kind_t raw_kind = decode_raw_ps_a_form(&raw_ops, cdg.insn);
+    if ( raw_kind == RAW_PS_SUM0 || raw_kind == RAW_PS_SUM1 )
+    {
+      merror_t err = emit_ps_sum_ops(cdg, raw_ops.dst, raw_ops.a, raw_ops.b, raw_ops.c, raw_kind == RAW_PS_SUM0);
+      if ( err == MERR_OK || !full_fix_enabled )
+        return err;
+      return emit_ps_helper(cdg, raw_kind == RAW_PS_SUM0 ? "__ppc_ps_sum0" : "__ppc_ps_sum1", 1, 3);
+    }
+    if ( raw_kind == RAW_PS_SEL )
+      return early_or_helper(emit_ps_sel_ops(cdg, raw_ops.dst, raw_ops.a, raw_ops.b, raw_ops.c), "__ppc_ps_sel", 3);
 
     if ( cdg.insn.itype == PPC_ps_sum0 || is_ps_sum0_mnemonic(cdg.insn) )
     {
+      merror_t err = emit_ps_sum(cdg, true);
+      if ( err == MERR_OK || !full_fix_enabled )
+        return err;
+
       op_dtype_t dtype = dt_float;
       if ( should_scalarize_ps_result(cdg.insn, &dtype) )
       {
@@ -1567,6 +2259,10 @@ struct ppc_ps_filter_t : public microcode_filter_t
 
     if ( cdg.insn.itype == PPC_ps_sum1 || is_ps_sum1_mnemonic(cdg.insn) )
     {
+      merror_t err = emit_ps_sum(cdg, false);
+      if ( err == MERR_OK || !full_fix_enabled )
+        return err;
+
       op_dtype_t dtype = dt_float;
       if ( should_scalarize_ps_result(cdg.insn, &dtype) )
       {
@@ -1576,44 +2272,64 @@ struct ppc_ps_filter_t : public microcode_filter_t
       return emit_ps_helper(cdg, "__ppc_ps_sum1", 1, 3);
     }
 
+    if ( cdg.insn.itype == PPC_ps_sel || is_ps_sel_mnemonic(cdg.insn) )
+      return early_or_helper(emit_ps_sel(cdg), "__ppc_ps_sel", 3);
+
     switch ( cdg.insn.itype )
     {
       case PPC_psq_l:
         if ( emit_psq_load(cdg) == MERR_OK )
           return MERR_OK;
+        if ( !full_fix_enabled )
+          return MERR_INSN;
         return emit_psq_helper(cdg, "__ppc_psq_l", false);
 
       case PPC_psq_st:
         if ( emit_psq_store(cdg) == MERR_OK )
           return MERR_OK;
+        if ( !full_fix_enabled )
+          return MERR_INSN;
         return emit_psq_helper(cdg, "__ppc_psq_st", true);
 
-      case PPC_psq_lu:  return emit_psq_helper(cdg, "__ppc_psq_lu", false);
-      case PPC_psq_lx:  return emit_psq_helper(cdg, "__ppc_psq_lx", false);
-      case PPC_psq_lux: return emit_psq_helper(cdg, "__ppc_psq_lux", false);
-      case PPC_psq_stu: return emit_psq_helper(cdg, "__ppc_psq_stu", true);
-      case PPC_psq_stx: return emit_psq_helper(cdg, "__ppc_psq_stx", true);
-      case PPC_psq_stux:return emit_psq_helper(cdg, "__ppc_psq_stux", true);
+      case PPC_psq_lu:  return full_fix_enabled ? emit_psq_helper(cdg, "__ppc_psq_lu", false) : MERR_INSN;
+      case PPC_psq_lx:  return full_fix_enabled ? emit_psq_helper(cdg, "__ppc_psq_lx", false) : MERR_INSN;
+      case PPC_psq_lux: return full_fix_enabled ? emit_psq_helper(cdg, "__ppc_psq_lux", false) : MERR_INSN;
+      case PPC_psq_stu: return full_fix_enabled ? emit_psq_helper(cdg, "__ppc_psq_stu", true) : MERR_INSN;
+      case PPC_psq_stx: return full_fix_enabled ? emit_psq_helper(cdg, "__ppc_psq_stx", true) : MERR_INSN;
+      case PPC_psq_stux:return full_fix_enabled ? emit_psq_helper(cdg, "__ppc_psq_stux", true) : MERR_INSN;
 
       case PPC_ps_cmpu0: return emit_ps_compare_helper(cdg, "__ppc_ps_cmpu0");
       case PPC_ps_cmpu1: return emit_ps_compare_helper(cdg, "__ppc_ps_cmpu1");
       case PPC_ps_cmpo0: return emit_ps_compare_helper(cdg, "__ppc_ps_cmpo0");
       case PPC_ps_cmpo1: return emit_ps_compare_helper(cdg, "__ppc_ps_cmpo1");
 
-      case PPC_ps_add: return emit_ps_lanewise_binary(cdg, m_fadd);
-      case PPC_ps_sub: return emit_ps_lanewise_binary(cdg, m_fsub);
-      case PPC_ps_mul: return emit_ps_lanewise_binary(cdg, m_fmul);
-      case PPC_ps_div: return emit_ps_lanewise_binary(cdg, m_fdiv);
-      case PPC_ps_muls0: return emit_ps_muls_lane(cdg, 0);
-      case PPC_ps_muls1: return emit_ps_muls_lane(cdg, 1);
-      case PPC_ps_neg: return emit_ps_lanewise_unary(cdg, m_fneg);
-      case PPC_ps_mr: return emit_ps_mr(cdg);
-      case PPC_ps_merge00: return emit_ps_merge(cdg, 2, 0, 3, 0);
-      case PPC_ps_merge01: return emit_ps_merge(cdg, 2, 0, 3, 1);
-      case PPC_ps_merge10: return emit_ps_merge(cdg, 2, 1, 3, 0);
-      case PPC_ps_merge11: return emit_ps_merge(cdg, 2, 1, 3, 1);
+      case PPC_ps_add: return early_or_helper(emit_ps_lanewise_binary(cdg, m_fadd), "__ppc_ps_add", 2);
+      case PPC_ps_sub: return early_or_helper(emit_ps_lanewise_binary(cdg, m_fsub), "__ppc_ps_sub", 2);
+      case PPC_ps_mul: return early_or_helper(emit_ps_lanewise_binary(cdg, m_fmul), "__ppc_ps_mul", 2);
+      case PPC_ps_div: return early_or_helper(emit_ps_lanewise_binary(cdg, m_fdiv), "__ppc_ps_div", 2);
+      case PPC_ps_muls0: return early_or_helper(emit_ps_muls_lane(cdg, 0), "__ppc_ps_muls0", 2);
+      case PPC_ps_muls1: return early_or_helper(emit_ps_muls_lane(cdg, 1), "__ppc_ps_muls1", 2);
+      case PPC_ps_madd: return early_or_helper(emit_ps_madd_like(cdg, false, false, -1), "__ppc_ps_madd", 3);
+      case PPC_ps_msub: return early_or_helper(emit_ps_madd_like(cdg, true, false, -1), "__ppc_ps_msub", 3);
+      case PPC_ps_nmadd: return early_or_helper(emit_ps_madd_like(cdg, false, true, -1), "__ppc_ps_nmadd", 3);
+      case PPC_ps_nmsub: return early_or_helper(emit_ps_madd_like(cdg, true, true, -1), "__ppc_ps_nmsub", 3);
+      case PPC_ps_madds0: return early_or_helper(emit_ps_madd_like(cdg, false, false, 0), "__ppc_ps_madds0", 3);
+      case PPC_ps_madds1: return early_or_helper(emit_ps_madd_like(cdg, false, false, 1), "__ppc_ps_madds1", 3);
+      case PPC_ps_neg: return early_or_helper(emit_ps_lanewise_unary(cdg, m_fneg), "__ppc_ps_neg", 1);
+      case PPC_ps_abs: return early_or_helper(emit_ps_unary_helper(cdg, "fabsf"), "__ppc_ps_abs", 1);
+      case PPC_ps_nabs: return early_or_helper(emit_ps_unary_helper(cdg, "fabsf", true), "__ppc_ps_nabs", 1);
+      case PPC_ps_mr: return early_or_helper(emit_ps_mr(cdg), "__ppc_ps_mr", 1);
+      case PPC_ps_merge00: return early_or_helper(emit_ps_merge(cdg, 2, 0, 3, 0), "__ppc_ps_merge00", 2);
+      case PPC_ps_merge01: return early_or_helper(emit_ps_merge(cdg, 2, 0, 3, 1), "__ppc_ps_merge01", 2);
+      case PPC_ps_merge10: return early_or_helper(emit_ps_merge(cdg, 2, 1, 3, 0), "__ppc_ps_merge10", 2);
+      case PPC_ps_merge11: return early_or_helper(emit_ps_merge(cdg, 2, 1, 3, 1), "__ppc_ps_merge11", 2);
+      case PPC_ps_res: return early_or_helper(emit_ps_unary_helper(cdg, "__ppc_ps_res_scalar"), "__ppc_ps_res", 1);
+      case PPC_ps_rsqrte: return early_or_helper(emit_ps_unary_helper(cdg, "__ppc_ps_rsqrte_scalar"), "__ppc_ps_rsqrte", 1);
+      case PPC_ps_sel: return early_or_helper(emit_ps_sel(cdg), "__ppc_ps_sel", 3);
 
       default:
+        if ( !full_fix_enabled )
+          return MERR_INSN;
         int first_arg = 1;
         int max_arg_qty = 0;
         if ( const char *helper = ps_helper_name(cdg.insn.itype, &first_arg, &max_arg_qty) )

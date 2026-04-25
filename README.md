@@ -28,7 +28,7 @@ The SDK CMake support deploys the plugin below `${IDABIN}/plugins/ppc_ps_hexrays
 
 Memory instructions are handled first because they affect stack-variable recovery:
 
-- Unquantized displacement-based `psq_l`, `psq_st` with `W=0, I=0` are emitted early as two 4-byte float lane loads/stores, improving Hex-Rays variable recognition before lvar allocation.
+- Displacement-based `psq_l`, `psq_st` with `I=0` are emitted early for the common exact forms used by Wii U code: `W=0` as two 4-byte float lane loads/stores, and `W=1` as a lane-0 float transfer plus the architectural lane-1 `1.0f` value. This improves Hex-Rays variable recognition before lvar allocation.
 - Non-displacement or quantized `psq_l`, `psq_st` forms still use explicit helpers, avoiding unsafe reinterpretation when exact lane memory semantics are not emitted.
 - Other `psq_*` forms are converted to explicit helper calls so they no longer appear as raw inline assembly.
 
@@ -37,29 +37,30 @@ Function prologue handling covers Wii U paired-single save sequences:
 - `stfd fN, slot(r1)` + `ps_merge10 fN, fN, fN` + `stfs fN, slot+8(r1)` is treated as a callee-save sequence rather than body code.
 - Delayed `mflr rX` + `stw rX, sender_lr(r1)` inside the same save block is marked as prologue so Hex-Rays does not attach the LR save to the first real branch/body block.
 
-Common lane-wise paired-single operations are lowered early to scalar float microcode where possible:
+Common paired-single operations are lowered early to scalar float microcode or per-lane scalar helper calls where possible:
 
 - `ps_add`, `ps_sub`, `ps_mul`, `ps_div`
 - `ps_muls0`, `ps_muls1`
+- `ps_madd`, `ps_msub`, `ps_nmadd`, `ps_nmsub`
+- `ps_madds0`, `ps_madds1`
 - `ps_neg`, `ps_mr`
+- `ps_abs`, `ps_nabs`
 - `ps_merge00`, `ps_merge01`, `ps_merge10`, `ps_merge11`
+- `ps_sum0`, `ps_sum1`
+- `ps_res`, `ps_rsqrte`
+- `ps_sel`
 
 Remaining paired-single operations are converted to typed helper calls:
 
-- `ps_madd`, `ps_msub`, `ps_nmadd`, `ps_nmsub`
-- `ps_madds0`, `ps_madds1`
-- `ps_abs`, `ps_nabs`
-- vector sum helpers `ps_sum0`, `ps_sum1`
-- reciprocal estimate helpers `ps_res`, `ps_rsqrte`
 - compare helpers `ps_cmpu0`, `ps_cmpu1`, `ps_cmpo0`, `ps_cmpo1`
 
-The scalar lane lowering lets the decompiler's normal optimizer delete unused lanes and recover ordinary float locals before final pseudocode is built. The helper calls preserve register dataflow for operations that are not yet lowered without pretending paired-single vectors are scalar doubles.
+Exact scalar lane lowering runs during initial microcode generation, even when the optional per-function ctree cleanup is not enabled. This lets the decompiler's normal optimizer delete unused lanes and recover ordinary float locals before final pseudocode is built. Remaining whole-pair helper calls preserve register dataflow for operations that are not yet lowered without pretending paired-single vectors are scalar doubles.
 
 The plugin installs a named `ppc_ps_t` typedef for paired-single values. This keeps helper signatures and propagated casts shorter than Hex-Rays' anonymous `struct { float ps0; float ps1; }` fallback, especially for expressions that reinterpret adjacent `float` fields as one paired-single value.
 
-Simple paired-single helper assignments to adjacent float fields are simplified back into lane-wise float operations when all inputs are unquantized `psq_l` values or other supported paired-single helpers. This currently covers `ps_add`, `ps_sub`, `ps_mul`, `ps_div`, `ps_muls0`, `ps_muls1`, `ps_neg`, `ps_mr`, and the `ps_merge*` family, so patterns like storing `__ppc_ps_add(__ppc_psq_l(&a, 0, 0), __ppc_psq_l(&b, 0, 0))` become two ordinary float assignments.
+Simple paired-single helper assignments to adjacent float fields are still simplified back into lane-wise float operations as a fallback cleanup when whole-pair helpers survive to ctree. This fallback now also reconstructs `ps_madd`/`ps_msub`/`ps_nmadd`/`ps_nmsub`, `ps_madds0`/`ps_madds1`, and `psq_l(..., 1, 0)` lane materialization, so matrix/vector helpers decompile more cleanly even when a whole-pair helper remains.
 
-`ps_sum0`/`ps_sum1` use a scalar-use heuristic. This improves common dot-product lowering such as `ps_mul` followed by `ps_sum0`, emitting `__ppc_ps_sum0_scalar(...)` instead of leaving inline assembly or a paired-single temporary when only the scalar lane is consumed.
+`ps_sum0`/`ps_sum1` are lowered early to scalar lane operations. The older scalar-use heuristic remains as a fallback for cases that cannot be emitted directly.
 
 Scalar PowerPC floating-point select is also handled:
 
