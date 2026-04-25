@@ -19,8 +19,8 @@ namespace
 constexpr int PS_WIDTH = 8;
 constexpr int PS_LANE_WIDTH = 4;
 constexpr const char *PS_TYPE_NAME = "ppc_ps_t";
-constexpr const char *ALWAYS_FIX_ACTION_NAME = "ppc_ps_hexrays:always_fix";
-constexpr const char *REG_SUBKEY = "ppc_ps_hexrays";
+constexpr const char *ALWAYS_FIX_ACTION_NAME = "ida_gekko_pseudocode:always_fix";
+constexpr const char *REG_SUBKEY = "ida_gekko_pseudocode";
 constexpr const char *REG_ALWAYS_FIX = "always_fix_paired_singles";
 
 struct function_gate_t
@@ -2536,7 +2536,7 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
 
   plugin_ctx_t()
   {
-    always_fix = reg_read_bool(REG_ALWAYS_FIX, false, REG_SUBKEY);
+    always_fix = reg_read_bool(REG_ALWAYS_FIX, true, REG_SUBKEY);
     filter.gate = this;
     always_fix_ah.ctx = this;
 
@@ -2554,7 +2554,7 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
                             -1,
                             ADF_OT_PLUGMOD | ADF_CHECKABLE));
     update_action_checked(ALWAYS_FIX_ACTION_NAME, always_fix);
-    msg("ppc_ps_hexrays: installed optional PowerPC paired-single Hex-Rays filter%s\n",
+    msg("ida_gekko_pseudocode: installed optional Gekko pseudocode filter%s\n",
         always_fix ? " (automatic fixes enabled)" : "");
   }
 
@@ -2581,7 +2581,7 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
 
   bool idaapi run(size_t) override
   {
-    msg("ppc_ps_hexrays: active\n");
+    msg("ida_gekko_pseudocode: active\n");
     return true;
   }
 };
@@ -2593,7 +2593,7 @@ int idaapi always_fix_ah_t::activate(action_activation_ctx_t *actx)
 
   vdui_t *vu = actx != nullptr ? get_widget_vdui(actx->widget) : nullptr;
   ctx->set_always_fix(!ctx->always_fix, vu);
-  msg("ppc_ps_hexrays: automatic paired-single fixes %s\n", ctx->always_fix ? "enabled" : "disabled");
+  msg("ida_gekko_pseudocode: automatic paired-single fixes %s\n", ctx->always_fix ? "enabled" : "disabled");
   return 1;
 }
 
@@ -2624,8 +2624,8 @@ plugin_t PLUGIN =
   init,
   nullptr,
   nullptr,
-  "PowerPC paired-single Hex-Rays support",
-  "Adds microcode/helper support for Wii U paired-single instructions.",
-  "PPC paired-single Hex-Rays",
+  "IDA Gekko Pseudocode Extension",
+  "IDA Pro plugin that improves Hex-Rays pseudocode for PowerPC paired-single instructions.",
+  "IDA Gekko Pseudocode Extension",
   nullptr,
 };

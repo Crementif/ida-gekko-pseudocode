@@ -1,11 +1,11 @@
 {
   "IDAMetadataDescriptorVersion": 1,
   "plugin": {
-    "name": "ppc_ps_hexrays",
-    "entryPoint": "ppc_ps_hexrays",
+    "name": "ida_gekko_pseudocode",
+    "entryPoint": "GekkoHR",
     "categories": ["decompilation"],
     "idaVersions": ">=9.3",
-    "description": "Hex-Rays microcode support for Wii U PowerPC paired-single instructions.",
+    "description": "IDA Pro plugin that improves Hex-Rays pseudocode for PowerPC paired-single instructions on Gekko-based targets.",
     "version": "0.1.0"
   }
 }

@@ -1,5 +1,9 @@
-# PowerPC paired-single plugin for IDA's Pseudocode
+# IDA Gekko Pseudocode Extension
+**IDA Pro plugin for improving paired-single pseudocode decompilation on PowerPC targets like the GameCube, Wii, and Wii U.**
 
+---
+
+## Description
 This IDA plugin (currently targetting IDA 9.3) makes various improvements to the paired single floating point instructions support inside the decompiled pseudocode in IDA.
 
 Although IDA supports instructions like e.g. `psq_l`, `psq_st`, these will show up as inline assembly statements `` inside the pseudocode, usually interleaved with normal floating point code.
@@ -8,6 +12,7 @@ Other times, the pseudocode would get confused and assume that the function setu
 Both of these issues make it quite hard to look through floating point heavy code in GameCube, Wii and Wii U games or executables.
 That is what led me to creating this plugin, albeit with a healthy dose of AI coding. So use it or don't if the latter isn't your thing.
 
+
 ## Preview
 
 | Before | After |
@@ -15,23 +20,49 @@ That is what led me to creating this plugin, albeit with a healthy dose of AI co
 | ![Before small](images/before_small.png) | ![After small](images/after_small.png) |
 | ![Before big](images/before_big.png) | ![After big](images/after_big.png) |
 
+## Install
+
+The release builds of this plugin are compiled with the IDA 9.3 SP1 SDK.
+For older/newer IDA versions, you will likely have to build from source with the appropriate IDA SDK version.
+
+To install from GitHub releases:
+
+1. Download the latest release from `https://github.com/Crementif/ida-gekko-pseudocode/releases`.
+2. Extract the release archive.
+3. Copy the included `ida_gekko_pseudocode` plugin directory into your IDA plugins directory.
+4. Restart IDA if it was already running.
+
+Typical plugin locations are:
+
+- `%APPDATA%\Hex-Rays\IDA Pro\plugins\`
+- `<IDA install dir>\plugins\`
+
+Now, whenever you decompile a function that contains paired-single instructions, the plugin will automatically apply its improvements to the pseudocode output.
+It doesn't retroactively change existing pseudocode, so you might have to press `F5` again in already-open pseudocode views to see the changes.
+
+Sometimes, you might want to see the original pseudocode for a project (temporarily).
+You can disable it on a per-database basis (or temporarily disable it before pressing `F5`) by right-clicking in the pseudocode view and then toggling the "Always Fix Paired Singles In Functions" option in the context menu.
+From now on, the plugin should have no effects when you decompile functions in that database, until you re-enable the option.
+
+You might have to go to `Edit`->`Other`->`Reset decompiler information` to clear out any changes that the plugin made.
+Make sure to not toggle any aggressive options here. I think the microcode option is really the only one necessary.
+
 ## Build
 
 Set `IDASDK` to the IDA SDK root, either the repository root or its `src` directory, and `IDABIN` to your IDA install directory, then build with CMake and MSVC:
 
 ```cmd
-cd ppc_ps_hexrays
 cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
 Use the matching Visual Studio generator for your installed MSVC version if it differs.
 
-If `IDASDK` is not set, this project defaults to `../ida-sdk` from this repository.
+If `IDASDK` is not set, this project defaults to the in-repo `ida-sdk` submodule. If you cloned without submodules, run `git submodule update --init --recursive` first.
 
 If CMake is not on `PATH`, run the commands from a Visual Studio Developer PowerShell after installing CMake, or use the CMake executable bundled with Visual Studio.
 
-The SDK CMake support deploys the plugin below `${IDABIN}/plugins/ppc_ps_hexrays/` when `IDABIN` points at an IDA installation. You can also copy the produced plugin directory to `%APPDATA%\Hex-Rays\IDA Pro\plugins\`.
+The SDK CMake support deploys the plugin below `${IDABIN}/plugins/` when `IDABIN` points at an IDA installation. You can also copy the produced plugin directory to `%APPDATA%\Hex-Rays\IDA Pro\plugins\`.
 
 ## Current Coverage
 

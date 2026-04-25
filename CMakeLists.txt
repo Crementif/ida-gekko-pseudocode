@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.27)
-project(ppc_ps_hexrays)
+project(ida_gekko_pseudocode)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT DEFINED ENV{IDASDK})
-  set(ENV{IDASDK} "${CMAKE_CURRENT_LIST_DIR}/../ida-sdk")
+  set(ENV{IDASDK} "${CMAKE_CURRENT_LIST_DIR}/ida-sdk")
 endif()
 
 if(EXISTS "$ENV{IDASDK}/src/cmake/bootstrap.cmake")
@@ -19,16 +19,18 @@ endif()
 find_package(idasdk REQUIRED)
 
 if(WIN32 AND NOT MSVC)
-  message(FATAL_ERROR "ppc_ps_hexrays is intended to be built with MSVC on Windows")
+  message(FATAL_ERROR "ida_gekko_pseudocode is intended to be built with MSVC on Windows")
 endif()
 
-ida_add_plugin(ppc_ps_hexrays
+ida_add_plugin(ida_gekko_pseudocode
+  OUTPUT_NAME
+    GekkoHR
   SOURCES
-    src/ppc_ps_hexrays.cpp
+    src/ida_gekko_pseudocode.cpp
   METADATA_JSON
     ida-plugin.json
 )
 
 if(MSVC)
-  target_compile_options(ppc_ps_hexrays PRIVATE /permissive- /Zc:__cplusplus)
+  target_compile_options(ida_gekko_pseudocode PRIVATE /permissive- /Zc:__cplusplus)
 endif()
