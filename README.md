@@ -6,14 +6,17 @@
 ## Description
 This IDA plugin (currently targetting IDA 9.3) makes various improvements to the paired single floating point instructions support inside the decompiled pseudocode in IDA.
 
-Although IDA supports instructions like e.g. `psq_l`, `psq_st`, these will show up as inline assembly statements `` inside the pseudocode, usually interleaved with normal floating point code.
-Other times, the pseudocode would get confused and assume that the function setup happened much earlier and misplace the start of the body's function, which leads to be bad code generation.
+It currently fixes the following issues:
+ - The pseudocode shows all paired single instructions using inline assembly like `__asm { psq_l f12, 0(r3), 0, 0 }` inside the pseudocode. This makes the math hard to read, partially due to it often being badly interleaved with regular floating point code.
+ - `ps_merge*` instructions are also used in the pseudocode function prologues, which causes the stack setup to end abruptly and become part of the function body which leads to further degradation of the decompilation quality.
 
-Both of these issues make it quite hard to look through floating point heavy code in GameCube, Wii and Wii U games or executables.
+Both of these issues made it harder than necessary to look through floating point heavy code in GameCube, Wii and Wii U games.  
 That is what led me to creating this plugin, albeit with a healthy dose of AI coding. So use it or don't if the latter isn't your thing.
 
-
 ## Preview
+
+I wanted to make the SIMD code look as close as possible to the regular floating point code, and not emit a lot of Gekko-specific intrinsics if possible.  
+There's a fallback to intrinsics for more complex operations.
 
 | Before | After |
 |---|---|
