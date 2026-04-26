@@ -30,7 +30,7 @@ For older/newer IDA versions, you will likely have to build from source with the
 
 To install from GitHub releases:
 
-1. Download the latest release from `https://github.com/Crementif/ida-gekko-pseudocode/releases`.
+1. Download the latest release from [https://github.com/Crementif/ida-gekko-pseudocode/releases](https://github.com/Crementif/ida-gekko-pseudocode/releases).
 2. Extract the release archive.
 3. Copy the included `ida_gekko_pseudocode` plugin directory into your IDA plugins directory.
 4. Restart IDA if it was already running.
