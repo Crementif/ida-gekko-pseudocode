@@ -9,6 +9,10 @@
 #include <typeinf.hpp>
 #include <registry.hpp>
 
+#include "const_type_toggle_action.hpp"
+#include "wiiu_save_prolog.hpp"
+#include "selection_mass_type_action.hpp"
+
 // Dummy implementation of uint128 operator<< to satisfy MSVC linker when it instantiates
 // unreferenced inline functions like builtin_widget_mask_from_id from kernwin.hpp.
 uint128 operator<<(const uint128&, int) { return uint128(); }
@@ -20,6 +24,7 @@ constexpr int PS_WIDTH = 8;
 constexpr int PS_LANE_WIDTH = 4;
 constexpr const char *PS_TYPE_NAME = "ppc_ps_t";
 constexpr const char *ALWAYS_FIX_ACTION_NAME = "ida_gekko_pseudocode:always_fix";
+constexpr const char *TOGGLE_CONST_ACTION_NAME = "ida_gekko_pseudocode:toggle_const_type";
 constexpr const char *REG_SUBKEY = "ida_gekko_pseudocode";
 constexpr const char *REG_ALWAYS_FIX = "always_fix_paired_singles";
 
@@ -272,200 +277,6 @@ static bool make_ps_type(tinfo_t *out)
   return true;
 }
 
-static bool is_wiiu_save_prolog_candidate(uint16 itype)
-{
-  switch ( itype )
-  {
-    case PPC_stwu:
-    case PPC_stmw:
-    case PPC_mflr:
-    case PPC_mr:
-    case PPC_stw:
-    case PPC_stfd:
-    case PPC_stfs:
-    case PPC_ps_merge10:
-      return true;
-    default:
-      return false;
-  }
-}
-
-static bool collect_wiiu_save_prolog(qvector<insn_t> *out, ea_t ea)
-{
-  func_t *fn = get_func(ea);
-  if ( fn == nullptr )
-    return false;
-
-  ea_t cur = fn->start_ea;
-  for ( int nins = 0; nins < 32 && cur < fn->end_ea; ++nins )
-  {
-    insn_t insn;
-    if ( decode_insn(&insn, cur) <= 0 )
-      break;
-    if ( !is_wiiu_save_prolog_candidate(insn.itype) )
-      break;
-
-    out->push_back(insn);
-    cur = insn.ea + insn.size;
-  }
-
-  return !out->empty();
-}
-
-static bool is_displ_stack_store(const insn_t &insn, uint16 itype, int reg)
-{
-  return insn.itype == itype
-      && is_same_reg(insn.Op1, reg)
-      && insn.Op2.type == o_displ;
-}
-
-static bool same_stack_slot_delta(const op_t &from, const op_t &to, sval_t delta)
-{
-  return from.type == o_displ
-      && to.type == o_displ
-      && from.phrase == to.phrase
-      && sval_t(to.addr) - sval_t(from.addr) == delta;
-}
-
-static bool is_self_merge10(const insn_t &insn)
-{
-  return insn.itype == PPC_ps_merge10
-      && insn.Op1.type == o_reg
-      && is_same_reg(insn.Op2, insn.Op1.reg)
-      && is_same_reg(insn.Op3, insn.Op1.reg);
-}
-
-static bool find_ps_lane_save_pattern(
-        const qvector<insn_t> &insns,
-        size_t merge_idx,
-        ea_t *stfd_ea,
-        ea_t *merge_ea,
-        ea_t *stfs_ea)
-{
-  if ( merge_idx >= insns.size() || !is_self_merge10(insns[merge_idx]) )
-    return false;
-
-  const int reg = insns[merge_idx].Op1.reg;
-  const insn_t *stfd = nullptr;
-  for ( int i = int(merge_idx) - 1; i >= 0; --i )
-  {
-    if ( is_displ_stack_store(insns[i], PPC_stfd, reg) )
-    {
-      stfd = &insns[i];
-      break;
-    }
-  }
-  if ( stfd == nullptr )
-    return false;
-
-  const insn_t *stfs = nullptr;
-  for ( size_t i = merge_idx + 1; i < insns.size(); ++i )
-  {
-    if ( is_displ_stack_store(insns[i], PPC_stfs, reg)
-      && same_stack_slot_delta(stfd->Op2, insns[i].Op2, 8) )
-    {
-      stfs = &insns[i];
-      break;
-    }
-  }
-  if ( stfs == nullptr )
-    return false;
-
-  if ( stfd_ea != nullptr )
-    *stfd_ea = stfd->ea;
-  if ( merge_ea != nullptr )
-    *merge_ea = insns[merge_idx].ea;
-  if ( stfs_ea != nullptr )
-    *stfs_ea = stfs->ea;
-  return true;
-}
-
-static bool is_wiiu_ps_lane_save_prolog_insn(const insn_t &insn)
-{
-  qvector<insn_t> insns;
-  if ( !collect_wiiu_save_prolog(&insns, insn.ea) )
-    return false;
-
-  for ( size_t i = 0; i < insns.size(); ++i )
-  {
-    ea_t stfd_ea = BADADDR;
-    ea_t merge_ea = BADADDR;
-    ea_t stfs_ea = BADADDR;
-    if ( find_ps_lane_save_pattern(insns, i, &stfd_ea, &merge_ea, &stfs_ea)
-      && (insn.ea == stfd_ea || insn.ea == merge_ea || insn.ea == stfs_ea) )
-    {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-static bool is_wiiu_lr_save_prolog_insn(const insn_t &insn)
-{
-  qvector<insn_t> insns;
-  if ( !collect_wiiu_save_prolog(&insns, insn.ea) )
-    return false;
-
-  for ( size_t i = 0; i < insns.size(); ++i )
-  {
-    if ( insns[i].itype != PPC_mflr || insns[i].Op1.type != o_reg )
-      continue;
-
-    const int reg = insns[i].Op1.reg;
-    for ( size_t j = i + 1; j < insns.size(); ++j )
-    {
-      if ( is_displ_stack_store(insns[j], PPC_stw, reg) )
-        return insn.ea == insns[i].ea || insn.ea == insns[j].ea;
-    }
-  }
-
-  return false;
-}
-
-static bool is_wiiu_save_prolog_insn(const insn_t &insn)
-{
-  return is_wiiu_ps_lane_save_prolog_insn(insn)
-      || is_wiiu_lr_save_prolog_insn(insn);
-}
-
-static void mark_wiiu_save_prolog_insns(ignore_micro_t *ignore, ea_t func_ea)
-{
-  qvector<insn_t> insns;
-  if ( !collect_wiiu_save_prolog(&insns, func_ea) )
-    return;
-
-  for ( size_t i = 0; i < insns.size(); ++i )
-  {
-    ea_t stfd_ea = BADADDR;
-    ea_t merge_ea = BADADDR;
-    ea_t stfs_ea = BADADDR;
-    if ( find_ps_lane_save_pattern(insns, i, &stfd_ea, &merge_ea, &stfs_ea) )
-    {
-      ignore->mark_prolog_insn(stfd_ea);
-      ignore->mark_prolog_insn(merge_ea);
-      ignore->mark_prolog_insn(stfs_ea);
-    }
-  }
-
-  for ( size_t i = 0; i < insns.size(); ++i )
-  {
-    if ( insns[i].itype != PPC_mflr || insns[i].Op1.type != o_reg )
-      continue;
-
-    const int reg = insns[i].Op1.reg;
-    for ( size_t j = i + 1; j < insns.size(); ++j )
-    {
-      if ( is_displ_stack_store(insns[j], PPC_stw, reg) )
-      {
-        ignore->mark_prolog_insn(insns[i].ea);
-        ignore->mark_prolog_insn(insns[j].ea);
-        break;
-      }
-    }
-  }
-}
-
 static bool make_u32_type(tinfo_t *out)
 {
   *out = tinfo_t(BTF_UINT32);
@@ -475,6 +286,18 @@ static bool make_u32_type(tinfo_t *out)
 static bool make_int_type(tinfo_t *out)
 {
   *out = tinfo_t(BTF_INT);
+  return true;
+}
+
+static bool make_bool_type(tinfo_t *out)
+{
+  *out = tinfo_t(BTF_BOOL);
+  return true;
+}
+
+static bool make_void_type(tinfo_t *out)
+{
+  *out = tinfo_t(BTF_VOID);
   return true;
 }
 
@@ -1784,6 +1607,85 @@ static cexpr_t *clone_expr(const cexpr_t *e)
   return e != nullptr ? new cexpr_t(*e) : nullptr;
 }
 
+static bool is_reg_var_expr(const cexpr_t *e, int reg)
+{
+  e = skip_casts(e);
+  if ( e == nullptr || e->op != cot_var )
+    return false;
+
+  const lvar_t &lv = e->v.getv();
+  return lv.is_reg_var() && mreg2reg(lv.get_reg1(), lv.width) == reg;
+}
+
+static const cexpr_t *find_reg_var_expr(const citem_t *item, int reg)
+{
+  if ( item == nullptr )
+    return nullptr;
+
+  struct ida_local reg_var_finder_t : public ctree_visitor_t
+  {
+    int reg = -1;
+    const cexpr_t *found = nullptr;
+
+    explicit reg_var_finder_t(int r) : ctree_visitor_t(CV_FAST), reg(r) {}
+
+    int idaapi visit_expr(cexpr_t *expr) override
+    {
+      if ( is_reg_var_expr(expr, reg) )
+      {
+        found = expr;
+        return 1;
+      }
+      return 0;
+    }
+  };
+
+  reg_var_finder_t finder(reg);
+  finder.apply_to_exprs(const_cast<citem_t *>(item), nullptr);
+  return finder.found;
+}
+
+static cexpr_t *make_helper_call_expr(
+        const char *helper_name,
+        const tinfo_t &ret_type,
+        ea_t ea,
+        cexpr_t *arg0=nullptr,
+        cexpr_t *arg1=nullptr)
+{
+  if ( helper_name == nullptr )
+  {
+    delete arg0;
+    delete arg1;
+    return nullptr;
+  }
+
+  cexpr_t *callee = new cexpr_t();
+  callee->op = cot_helper;
+  callee->helper = qstrdup(helper_name);
+  callee->ea = ea;
+
+  cexpr_t *call = new cexpr_t();
+  call->op = cot_call;
+  call->x = callee;
+  call->a = new carglist_t();
+  call->a->flags |= CFL_HELPER;
+  call->type = ret_type;
+  call->ea = ea;
+
+  auto append_arg = [&](cexpr_t *arg)
+  {
+    if ( arg == nullptr )
+      return;
+    carg_t &call_arg = call->a->push_back();
+    call_arg.consume_cexpr(arg);
+    call_arg.ea = ea;
+  };
+
+  append_arg(arg0);
+  append_arg(arg1);
+  return call;
+}
+
 static const cexpr_t *match_helper_call(const cexpr_t *e, const char *helper)
 {
   e = skip_casts(e);
@@ -2034,7 +1936,30 @@ static cexpr_t *make_float_unary_expr(ctype_t op, cexpr_t *arg, ea_t ea)
 
 static cexpr_t *make_float_assign(cexpr_t *dst, cexpr_t *value, ea_t ea)
 {
+  if ( dst == nullptr || value == nullptr )
+  {
+    delete dst;
+    delete value;
+    return nullptr;
+  }
+
   value->type = dst->type;
+  cexpr_t *asg = new cexpr_t(cot_asg, dst, value);
+  asg->ea = ea;
+  asg->type = dst->type;
+  asg->calc_type(true);
+  return asg;
+}
+
+static cexpr_t *make_assign_expr(cexpr_t *dst, cexpr_t *value, ea_t ea)
+{
+  if ( dst == nullptr || value == nullptr )
+  {
+    delete dst;
+    delete value;
+    return nullptr;
+  }
+
   cexpr_t *asg = new cexpr_t(cot_asg, dst, value);
   asg->ea = ea;
   asg->type = dst->type;
@@ -2225,6 +2150,240 @@ static cexpr_t *build_ps_lane_rewrite(const cexpr_t *dst_base, const cexpr_t *rh
   comma->ea = ea;
   comma->calc_type(true);
   return comma;
+}
+
+struct atomic_lwarx_dcbst_t
+{
+  int load_reg = -1;
+  int base_reg = -1;
+  ea_t lwarx_ea = BADADDR;
+  ea_t dcbst_ea = BADADDR;
+};
+
+struct atomic_stwcx_t
+{
+  int value_reg = -1;
+  int base_reg = -1;
+  ea_t stwcx_ea = BADADDR;
+};
+
+static bool decode_atomic_lwarx_dcbst(const cinsn_t &ins, atomic_lwarx_dcbst_t *out)
+{
+  if ( ins.op != cit_asm || ins.casm == nullptr || ins.casm->size() != 2 || out == nullptr )
+    return false;
+
+  insn_t lwarx;
+  insn_t dcbst;
+  if ( decode_insn(&lwarx, ins.casm->at(0)) <= 0 || decode_insn(&dcbst, ins.casm->at(1)) <= 0 )
+    return false;
+
+  if ( !has_mnem(lwarx, "lwarx")
+    || !has_mnem(dcbst, "dcbst")
+    || lwarx.Op1.type != o_reg
+    || !is_imm_value(lwarx.Op2, 0)
+    || lwarx.Op3.type != o_reg
+    || !is_imm_value(dcbst.Op1, 0)
+    || dcbst.Op2.type != o_reg
+    || dcbst.Op2.reg != lwarx.Op3.reg )
+  {
+    return false;
+  }
+
+  out->load_reg = lwarx.Op1.reg;
+  out->base_reg = lwarx.Op3.reg;
+  out->lwarx_ea = lwarx.ea;
+  out->dcbst_ea = dcbst.ea;
+  return true;
+}
+
+static bool decode_atomic_stwcx(const cinsn_t &ins, atomic_stwcx_t *out)
+{
+  if ( ins.op != cit_asm || ins.casm == nullptr || ins.casm->size() != 1 || out == nullptr )
+    return false;
+
+  insn_t stwcx;
+  if ( decode_insn(&stwcx, ins.casm->at(0)) <= 0 )
+    return false;
+
+  if ( !has_mnem(stwcx, "stwcx")
+    || stwcx.Op1.type != o_reg
+    || !is_imm_value(stwcx.Op2, 0)
+    || stwcx.Op3.type != o_reg )
+  {
+    return false;
+  }
+
+  out->value_reg = stwcx.Op1.reg;
+  out->base_reg = stwcx.Op3.reg;
+  out->stwcx_ea = stwcx.ea;
+  return true;
+}
+
+static bool replace_atomic_condition_expr(cexpr_t *cond, cexpr_t *call)
+{
+  if ( cond == nullptr || call == nullptr )
+    return false;
+
+  if ( cond->op == cot_lnot && cond->x != nullptr )
+  {
+    cond->x->replace_by(call);
+    cond->calc_type(true);
+    return true;
+  }
+
+  if ( (cond->op == cot_eq || cond->op == cot_ne) && cond->x != nullptr && cond->y != nullptr )
+  {
+    if ( is_zero_expr(cond->x) )
+    {
+      cond->y->replace_by(call);
+      cond->calc_type(true);
+      return true;
+    }
+    if ( is_zero_expr(cond->y) )
+    {
+      cond->x->replace_by(call);
+      cond->calc_type(true);
+      return true;
+    }
+  }
+
+  cond->replace_by(call);
+  cond->calc_type(true);
+  return true;
+}
+
+static cinsn_t *make_block_insn(ea_t ea)
+{
+  cinsn_t *block = new cinsn_t();
+  block->op = cit_block;
+  block->cblock = new cblock_t();
+  block->ea = ea;
+  return block;
+}
+
+static void append_cloned_insn(cinsn_t *block, const cinsn_t &src)
+{
+  if ( block == nullptr || block->op != cit_block )
+    return;
+
+  cinsn_t &dst = block->new_insn(src.ea);
+  dst = src;
+}
+
+static void append_expr_insn(cinsn_t *block, cexpr_t *expr, ea_t ea)
+{
+  if ( block == nullptr || block->op != cit_block )
+  {
+    delete expr;
+    return;
+  }
+
+  cinsn_t &dst = block->new_insn(ea);
+  dst.op = cit_expr;
+  dst.cexpr = expr;
+  dst.ea = ea;
+}
+
+static void rewrite_ppc_atomic_update_loops(cfunc_t *cfunc)
+{
+  struct ida_local atomic_loop_rewriter_t : public ctree_visitor_t
+  {
+    atomic_loop_rewriter_t() : ctree_visitor_t(CV_FAST | CV_INSNS) {}
+
+    int idaapi visit_insn(cinsn_t *ins) override
+    {
+      if ( ins->op != cit_do || ins->cdo == nullptr || ins->cdo->body == nullptr )
+        return 0;
+
+      cinsn_t *body = ins->cdo->body;
+      if ( body->op != cit_block || body->cblock == nullptr || body->cblock->size() != 4 )
+        return 0;
+
+      cblock_t::iterator p = body->cblock->begin();
+      cinsn_t *base_assign = &*p++;
+      cinsn_t *load_cache_asm = &*p++;
+      cinsn_t *value_assign = &*p++;
+      cinsn_t *store_asm = &*p;
+
+      atomic_lwarx_dcbst_t load_cache;
+      atomic_stwcx_t store;
+      if ( !decode_atomic_lwarx_dcbst(*load_cache_asm, &load_cache)
+        || !decode_atomic_stwcx(*store_asm, &store)
+        || load_cache.base_reg != store.base_reg )
+      {
+        return 0;
+      }
+
+      if ( base_assign->op != cit_expr
+        || base_assign->cexpr == nullptr
+        || base_assign->cexpr->op != cot_asg
+        || !is_reg_var_expr(base_assign->cexpr->x, load_cache.base_reg)
+        || value_assign->op != cit_expr
+        || value_assign->cexpr == nullptr
+        || value_assign->cexpr->op != cot_asg
+        || !is_reg_var_expr(value_assign->cexpr->x, store.value_reg) )
+      {
+        return 0;
+      }
+
+      const cexpr_t *load_expr = find_reg_var_expr(value_assign->cexpr->y, load_cache.load_reg);
+      if ( load_expr == nullptr )
+        return 0;
+
+      tinfo_t u32_type;
+      tinfo_t bool_type;
+      tinfo_t void_type;
+      make_u32_type(&u32_type);
+      make_bool_type(&bool_type);
+      make_void_type(&void_type);
+
+      cexpr_t *lwarx_call = make_helper_call_expr(
+              "__ppc_lwarx",
+              u32_type,
+              load_cache.lwarx_ea,
+              clone_expr(base_assign->cexpr->x));
+      cexpr_t *load_assign_expr = make_assign_expr(clone_expr(load_expr), lwarx_call, load_cache.lwarx_ea);
+      cexpr_t *dcbst_call = make_helper_call_expr(
+              "__ppc_dcbst",
+              void_type,
+              load_cache.dcbst_ea,
+              clone_expr(base_assign->cexpr->x));
+      cexpr_t *stwcx_call = make_helper_call_expr(
+              "__ppc_stwcx",
+              bool_type,
+              store.stwcx_ea,
+              clone_expr(base_assign->cexpr->x),
+              clone_expr(value_assign->cexpr->x));
+      if ( load_assign_expr == nullptr || dcbst_call == nullptr || stwcx_call == nullptr )
+      {
+        delete load_assign_expr;
+        delete dcbst_call;
+        delete stwcx_call;
+        return 0;
+      }
+
+      if ( !replace_atomic_condition_expr(&ins->cdo->expr, stwcx_call) )
+      {
+        delete load_assign_expr;
+        delete dcbst_call;
+        delete stwcx_call;
+        return 0;
+      }
+
+      cinsn_t *new_body = make_block_insn(body->ea);
+      append_cloned_insn(new_body, *base_assign);
+      append_expr_insn(new_body, load_assign_expr, load_cache.lwarx_ea);
+      append_expr_insn(new_body, dcbst_call, load_cache.dcbst_ea);
+      append_cloned_insn(new_body, *value_assign);
+
+      delete ins->cdo->body;
+      ins->cdo->body = new_body;
+      return 0;
+    }
+  };
+
+  atomic_loop_rewriter_t rewriter;
+  rewriter.apply_to(&cfunc->body, nullptr);
 }
 
 static void rewrite_ps_pair_assignments(cfunc_t *cfunc)
@@ -2461,10 +2620,20 @@ struct always_fix_ah_t : public action_handler_t
   action_state_t idaapi update(action_update_ctx_t *uctx) override;
 };
 
+struct ui_listener_t : public event_listener_t
+{
+  plugin_ctx_t *ctx = nullptr;
+
+  ssize_t idaapi on_event(ssize_t code, va_list va) override;
+};
+
 struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_micro_t, public function_gate_t
 {
   ppc_ps_filter_t filter;
+  const_type_toggle_action_t const_type_toggle;
+  selection_mass_type_action_t selection_mass_type;
   always_fix_ah_t always_fix_ah;
+  ui_listener_t ui_listener;
   bool always_fix = false;
 
   static ea_t function_start_for_ea(ea_t ea)
@@ -2519,7 +2688,10 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
       cfunc_t *cfunc = va_arg(va, cfunc_t *);
       ctree_maturity_t mat = va_argi(va, ctree_maturity_t);
       if ( mat == CMAT_FINAL && ctx->should_fix_function(cfunc->entry_ea) )
+      {
+        rewrite_ppc_atomic_update_loops(cfunc);
         rewrite_ps_pair_assignments(cfunc);
+      }
     }
     else if ( event == hxe_populating_popup )
     {
@@ -2529,6 +2701,7 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
       if ( vu != nullptr )
       {
         attach_action_to_popup(widget, popup_handle, ALWAYS_FIX_ACTION_NAME, nullptr, SETMENU_APP);
+        attach_action_to_popup(widget, popup_handle, TOGGLE_CONST_ACTION_NAME, nullptr, SETMENU_APP);
       }
     }
     return 0;
@@ -2539,20 +2712,24 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
     always_fix = reg_read_bool(REG_ALWAYS_FIX, true, REG_SUBKEY);
     filter.gate = this;
     always_fix_ah.ctx = this;
+    ui_listener.ctx = this;
 
     init_ignore_micro();
     hook_event_listener(HT_IDP, this);
+    hook_event_listener(HT_UI, &ui_listener);
     install_hexrays_callback(hr_callback, this);
     install_microcode_filter(&filter, true);
-    register_action(ACTION_DESC_LITERAL_OWNER(
+
+    const_type_toggle.register_action();
+    selection_mass_type.register_action();
+
+    register_action(ACTION_DESC_LITERAL(
                             ALWAYS_FIX_ACTION_NAME,
                             "Always Fix Paired Singles In Functions",
                             &always_fix_ah,
-                            this,
                             nullptr,
                             "Automatically apply paired-single fixes to all decompiled functions",
-                            -1,
-                            ADF_OT_PLUGMOD | ADF_CHECKABLE));
+                            -1));
     update_action_checked(ALWAYS_FIX_ACTION_NAME, always_fix);
     msg("ida_gekko_pseudocode: installed optional Gekko pseudocode filter%s\n",
         always_fix ? " (automatic fixes enabled)" : "");
@@ -2560,8 +2737,12 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
 
   ~plugin_ctx_t() override
   {
+    const_type_toggle.unregister_action();
+    selection_mass_type.unregister_action();
+
     unregister_action(ALWAYS_FIX_ACTION_NAME);
     remove_hexrays_callback(hr_callback, this);
+    unhook_event_listener(HT_UI, &ui_listener);
     unhook_event_listener(HT_IDP, this);
     install_microcode_filter(&filter, false);
     term_ignore_micro();
@@ -2629,3 +2810,25 @@ plugin_t PLUGIN =
   "IDA Gekko Pseudocode Extension",
   nullptr,
 };
+
+ssize_t idaapi ui_listener_t::on_event(ssize_t code, va_list va)
+{
+    if ( code == ui_finish_populating_widget_popup )
+    {
+      TWidget *widget = va_arg(va, TWidget *);
+      TPopupMenu *popup_handle = va_arg(va, TPopupMenu *);
+      if ( widget == nullptr || ctx == nullptr )
+        return 0;
+
+      const int widget_type = get_widget_type(widget);
+      if ( widget_type == BWN_DISASM && ctx->const_type_toggle.can_toggle(widget, widget_type) )
+      {
+        attach_action_to_popup(widget, popup_handle, TOGGLE_CONST_ACTION_NAME, nullptr, SETMENU_APP);
+      }
+      else if ( widget_type == BWN_PSEUDOCODE && ctx->const_type_toggle.can_toggle(widget, widget_type) )
+      {
+        attach_action_to_popup(widget, popup_handle, TOGGLE_CONST_ACTION_NAME, nullptr, SETMENU_APP);
+      }
+    }
+    return 0;
+  }

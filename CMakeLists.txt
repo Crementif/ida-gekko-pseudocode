@@ -26,7 +26,10 @@ ida_add_plugin(ida_gekko_pseudocode
   OUTPUT_NAME
     GekkoHR
   SOURCES
+    src/const_type_toggle_action.cpp
+    src/selection_mass_type_action.cpp
     src/ida_gekko_pseudocode.cpp
+    src/wiiu_save_prolog.cpp
   METADATA_JSON
     ida-plugin.json
 )
