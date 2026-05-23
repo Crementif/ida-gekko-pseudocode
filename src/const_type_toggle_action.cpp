@@ -172,6 +172,26 @@ static bool get_toggle_target(toggle_target_t *out, TWidget *widget, int widget_
   return false;
 }
 
+static bool get_toggle_target(toggle_target_t *out, const action_ctx_base_t *actx)
+{
+  if ( out == nullptr || actx == nullptr || actx->widget == nullptr )
+    return false;
+
+  if ( actx->widget_type == BWN_PSEUDOCODE )
+    return get_pseudocode_toggle_target(out, get_widget_vdui(actx->widget));
+
+  if ( actx->widget_type != BWN_DISASM )
+    return false;
+
+  // Popup actions in disassembly are often opened over an operand/name while
+  // the caret remains elsewhere. Prefer the clicked value, then the line EA.
+  if ( actx->cur_value != BADADDR && get_ea_toggle_target(out, ea_t(actx->cur_value), nullptr) )
+    return true;
+  if ( actx->cur_ea != BADADDR && get_ea_toggle_target(out, actx->cur_ea, nullptr) )
+    return true;
+  return get_ea_toggle_target(out, get_screen_ea(), nullptr);
+}
+
 static void toggle_const_qualifier(tinfo_t *type)
 {
   if ( type == nullptr || type->empty() )
@@ -280,7 +300,7 @@ struct const_type_toggle_handler_t : public action_handler_t
       return 0;
 
     toggle_target_t target;
-    if ( !get_toggle_target(&target, actx->widget, actx->widget_type) )
+    if ( !get_toggle_target(&target, actx) )
       return 0;
 
     qstring target_name = describe_target(target);
@@ -341,4 +361,10 @@ bool const_type_toggle_action_t::can_toggle(TWidget *widget, int widget_type) co
 {
   toggle_target_t target;
   return get_toggle_target(&target, widget, widget_type);
+}
+
+bool const_type_toggle_action_t::can_toggle(const action_ctx_base_t *actx) const
+{
+  toggle_target_t target;
+  return get_toggle_target(&target, actx);
 }

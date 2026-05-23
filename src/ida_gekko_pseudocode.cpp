@@ -6,16 +6,19 @@
 #include <funcs.hpp>
 #include <hexrays.hpp>
 #include <allins.hpp>
+#include <name.hpp>
+#include <netnode.hpp>
 #include <typeinf.hpp>
-#include <registry.hpp>
 
 #include "const_type_toggle_action.hpp"
 #include "wiiu_save_prolog.hpp"
 #include "selection_mass_type_action.hpp"
 
+#ifdef _MSC_VER
 // Dummy implementation of uint128 operator<< to satisfy MSVC linker when it instantiates
 // unreferenced inline functions like builtin_widget_mask_from_id from kernwin.hpp.
 uint128 operator<<(const uint128&, int) { return uint128(); }
+#endif
 
 namespace
 {
@@ -25,8 +28,23 @@ constexpr int PS_LANE_WIDTH = 4;
 constexpr const char *PS_TYPE_NAME = "ppc_ps_t";
 constexpr const char *ALWAYS_FIX_ACTION_NAME = "ida_gekko_pseudocode:always_fix";
 constexpr const char *TOGGLE_CONST_ACTION_NAME = "ida_gekko_pseudocode:toggle_const_type";
-constexpr const char *REG_SUBKEY = "ida_gekko_pseudocode";
-constexpr const char *REG_ALWAYS_FIX = "always_fix_paired_singles";
+constexpr const char *ALWAYS_FIX_NODE_NAME = "$ ida_gekko_pseudocode";
+constexpr nodeidx_t ALWAYS_FIX_NODE_IDX = 0;
+
+static bool load_always_fix_setting()
+{
+  netnode node(ALWAYS_FIX_NODE_NAME);
+  return node == BADNODE || node.altval(ALWAYS_FIX_NODE_IDX) != 0;
+}
+
+static void save_always_fix_setting(bool enabled)
+{
+  netnode node;
+  if ( !node.create(ALWAYS_FIX_NODE_NAME) )
+    node = netnode(ALWAYS_FIX_NODE_NAME);
+  if ( node != BADNODE )
+    node.altset(ALWAYS_FIX_NODE_IDX, enabled ? 1 : 0);
+}
 
 struct function_gate_t
 {
@@ -1602,6 +1620,44 @@ static bool is_zero_expr(const cexpr_t *e)
   return e != nullptr && e->is_zero_const();
 }
 
+static bool same_var_ref(const var_ref_t &lhs, const var_ref_t &rhs)
+{
+  return lhs.compare(rhs) == 0;
+}
+
+static bool get_var_ref(const cexpr_t *e, var_ref_t *out)
+{
+  e = skip_casts(e);
+  if ( e == nullptr || e->op != cot_var )
+    return false;
+  if ( out != nullptr )
+    *out = e->v;
+  return true;
+}
+
+static bool is_var_expr(const cexpr_t *e, const var_ref_t &var)
+{
+  e = skip_casts(e);
+  return e != nullptr && e->op == cot_var && same_var_ref(e->v, var);
+}
+
+static int pointer_stride_bytes(const tinfo_t &ptr_type)
+{
+  if ( !ptr_type.is_ptr() )
+    return -1;
+
+  const size_t stride = remove_pointer(ptr_type).get_size();
+  if ( stride == BADSIZE || stride == 0 || stride > size_t(INT_MAX) )
+    return -1;
+  return int(stride);
+}
+
+static int pointer_step_bytes(const tinfo_t &ptr_type, int fallback=1)
+{
+  const int stride = pointer_stride_bytes(ptr_type);
+  return stride > 0 ? stride : fallback;
+}
+
 static cexpr_t *clone_expr(const cexpr_t *e)
 {
   return e != nullptr ? new cexpr_t(*e) : nullptr;
@@ -1650,39 +1706,39 @@ static cexpr_t *make_helper_call_expr(
         const tinfo_t &ret_type,
         ea_t ea,
         cexpr_t *arg0=nullptr,
-        cexpr_t *arg1=nullptr)
+        cexpr_t *arg1=nullptr,
+        cexpr_t *arg2=nullptr)
 {
   if ( helper_name == nullptr )
   {
     delete arg0;
     delete arg1;
+    delete arg2;
     return nullptr;
   }
 
-  cexpr_t *callee = new cexpr_t();
-  callee->op = cot_helper;
-  callee->helper = qstrdup(helper_name);
-  callee->ea = ea;
-
-  cexpr_t *call = new cexpr_t();
-  call->op = cot_call;
-  call->x = callee;
-  call->a = new carglist_t();
-  call->a->flags |= CFL_HELPER;
-  call->type = ret_type;
-  call->ea = ea;
+  carglist_t *args = new carglist_t();
+  args->flags |= CFL_HELPER;
 
   auto append_arg = [&](cexpr_t *arg)
   {
     if ( arg == nullptr )
       return;
-    carg_t &call_arg = call->a->push_back();
+    carg_t &call_arg = args->push_back();
     call_arg.consume_cexpr(arg);
     call_arg.ea = ea;
   };
 
   append_arg(arg0);
   append_arg(arg1);
+  append_arg(arg2);
+  cexpr_t *call = call_helper(ret_type, args, "%s", helper_name);
+  if ( call == nullptr )
+  {
+    delete args;
+    return nullptr;
+  }
+  call->ea = ea;
   return call;
 }
 
@@ -1967,6 +2023,283 @@ static cexpr_t *make_assign_expr(cexpr_t *dst, cexpr_t *value, ea_t ea)
   return asg;
 }
 
+static cexpr_t *make_int_const_expr(cfunc_t *cfunc, uint64 value, ea_t ea)
+{
+  cexpr_t *expr = make_num(value, cfunc, ea);
+  if ( expr != nullptr )
+    expr->ea = ea;
+  return expr;
+}
+
+static cexpr_t *make_cast_expr(cexpr_t *expr, const tinfo_t &type, ea_t ea)
+{
+  if ( expr == nullptr )
+    return nullptr;
+  if ( expr->type.equals_to(type) )
+    return expr;
+
+  cexpr_t *cast = new cexpr_t(cot_cast, expr);
+  cast->type = type;
+  cast->ea = ea;
+  return cast;
+}
+
+static bool split_pointer_base_offset(const cexpr_t **out_base, int *out_byte_off, const cexpr_t *expr)
+{
+  if ( out_base == nullptr || out_byte_off == nullptr )
+    return false;
+
+  expr = skip_casts(expr);
+  if ( expr == nullptr )
+    return false;
+
+  *out_base = expr;
+  *out_byte_off = 0;
+  if ( expr->op != cot_add && expr->op != cot_sub )
+    return true;
+  if ( expr->x == nullptr || expr->y == nullptr )
+    return false;
+
+  const cexpr_t *rhs = skip_casts(expr->y);
+  uint64 units = 0;
+  if ( rhs == nullptr || !rhs->get_const_value(&units) || units > uint64(INT_MAX) )
+    return true;
+
+  int scale = 1;
+  const cexpr_t *lhs = skip_casts(expr->x);
+  if ( lhs != nullptr && lhs->type.is_ptr() )
+  {
+    const int stride = pointer_stride_bytes(lhs->type);
+    if ( stride > 0 )
+      scale = stride;
+  }
+
+  *out_base = expr->x;
+  *out_byte_off = int(units) * scale;
+  if ( expr->op == cot_sub )
+    *out_byte_off = -*out_byte_off;
+  return true;
+}
+
+static cexpr_t *build_pointer_offset_expr(
+        cfunc_t *cfunc,
+        const cexpr_t *base,
+        const tinfo_t &ptr_type,
+        int byte_off,
+        ea_t ea)
+{
+  cexpr_t *expr = clone_expr(base);
+  if ( expr == nullptr )
+    return nullptr;
+  if ( byte_off == 0 )
+    return expr;
+
+  int units = byte_off;
+  tinfo_t use_type = ptr_type;
+  const int stride = pointer_stride_bytes(ptr_type);
+  if ( stride <= 0 || byte_off % stride != 0 )
+  {
+    tinfo_t char_type(BTF_CHAR);
+    if ( !use_type.create_ptr(char_type) )
+    {
+      delete expr;
+      return nullptr;
+    }
+  }
+  else
+  {
+    units = byte_off / stride;
+  }
+
+  expr = make_cast_expr(expr, use_type, ea);
+  cexpr_t *delta = make_int_const_expr(cfunc, qabs(units), ea);
+  if ( expr == nullptr || delta == nullptr )
+  {
+    delete expr;
+    delete delta;
+    return nullptr;
+  }
+
+  cexpr_t *adjusted = new cexpr_t(units >= 0 ? cot_add : cot_sub, expr, delta);
+  adjusted->ea = ea;
+  adjusted->calc_type(true);
+  return adjusted;
+}
+
+static cexpr_t *build_copy_start_expr(
+        cfunc_t *cfunc,
+        const cexpr_t *init_rhs,
+        const tinfo_t &ptr_type,
+        int advance_bytes,
+        ea_t ea,
+        int *out_init_byte_off=nullptr)
+{
+  const cexpr_t *base = nullptr;
+  int init_byte_off = 0;
+  if ( !split_pointer_base_offset(&base, &init_byte_off, init_rhs) )
+    return nullptr;
+  if ( out_init_byte_off != nullptr )
+    *out_init_byte_off = init_byte_off;
+  return build_pointer_offset_expr(cfunc, base, ptr_type, init_byte_off + advance_bytes, ea);
+}
+
+static cexpr_t *build_copy_size_expr(cfunc_t *cfunc, const cexpr_t *count_rhs, int elem_width, ea_t ea)
+{
+  if ( count_rhs == nullptr || elem_width <= 0 )
+    return nullptr;
+
+  uint64 count = 0;
+  if ( count_rhs->get_const_value(&count) )
+    return make_int_const_expr(cfunc, count * uint64(elem_width), ea);
+
+  if ( elem_width == 1 )
+    return clone_expr(count_rhs);
+
+  cexpr_t *mul = new cexpr_t(cot_mul, clone_expr(count_rhs), make_int_const_expr(cfunc, elem_width, ea));
+  mul->ea = ea;
+  mul->calc_type(true);
+  return mul;
+}
+
+static bool same_effect_expr(const cexpr_t *lhs, const cexpr_t *rhs)
+{
+  lhs = skip_casts(lhs);
+  rhs = skip_casts(rhs);
+  return lhs != nullptr && rhs != nullptr && lhs->equal_effect(*rhs);
+}
+
+static cexpr_t *build_copy_base_from_end_expr(
+        cfunc_t *cfunc,
+        const cexpr_t *init_rhs,
+        const cexpr_t *count_rhs,
+        const tinfo_t &ptr_type,
+        int elem_width,
+        ea_t ea)
+{
+  if ( cfunc == nullptr || init_rhs == nullptr || count_rhs == nullptr || elem_width <= 0 )
+    return nullptr;
+
+  cexpr_t *scaled_count = ptr_type.is_ptr() ? clone_expr(count_rhs) : build_copy_size_expr(cfunc, count_rhs, elem_width, ea);
+  if ( scaled_count == nullptr )
+    return nullptr;
+
+  const cexpr_t *expr = skip_casts(init_rhs);
+  if ( expr != nullptr && expr->op == cot_add && expr->x != nullptr && expr->y != nullptr )
+  {
+    if ( same_effect_expr(expr->y, scaled_count) )
+    {
+      delete scaled_count;
+      return clone_expr(expr->x);
+    }
+    if ( same_effect_expr(expr->x, scaled_count) )
+    {
+      cexpr_t *base = clone_expr(expr->y);
+      delete scaled_count;
+      return base;
+    }
+  }
+
+  delete scaled_count;
+
+  uint64 count = 0;
+  if ( !count_rhs->get_const_value(&count) || count > uint64(INT_MAX / elem_width) )
+    return nullptr;
+  return build_pointer_offset_expr(cfunc, init_rhs, ptr_type, -int(count) * elem_width, ea);
+}
+
+static bool make_memory_copy_types(
+        const char *decl,
+        tinfo_t *out_func_type,
+        tinfo_t *out_func_ptr_type,
+        tinfo_t *out_ret_type)
+{
+  tinfo_t func_type;
+  if ( !parse_decl(&func_type, nullptr, nullptr, decl, PT_TYP | PT_SIL | PT_SEMICOLON) )
+    return false;
+
+  if ( out_func_type != nullptr )
+    *out_func_type = func_type;
+  if ( out_ret_type != nullptr )
+    *out_ret_type = func_type.get_rettype();
+  if ( out_func_ptr_type != nullptr && !out_func_ptr_type->create_ptr(func_type) )
+    return false;
+  return true;
+}
+
+static cexpr_t *make_memory_copy_call_expr(
+        const char *name,
+        const char *decl,
+        cexpr_t *dst,
+        cexpr_t *src,
+        cexpr_t *size,
+        ea_t ea)
+{
+  if ( dst == nullptr || src == nullptr || size == nullptr )
+  {
+    delete dst;
+    delete src;
+    delete size;
+    return nullptr;
+  }
+
+  tinfo_t func_type;
+  tinfo_t func_ptr_type;
+  tinfo_t ret_type;
+  if ( !make_memory_copy_types(decl, &func_type, &func_ptr_type, &ret_type) )
+  {
+    delete dst;
+    delete src;
+    delete size;
+    return nullptr;
+  }
+
+  cexpr_t *callee = new cexpr_t();
+  const ea_t callee_ea = get_name_ea(BADADDR, name);
+  const bool is_external_helper = callee_ea == BADADDR;
+  if ( callee_ea == BADADDR )
+  {
+    callee->op = cot_helper;
+    callee->helper = qstrdup(name);
+    callee->type = func_ptr_type;
+    callee->ea = ea;
+  }
+  else
+  {
+    callee->op = cot_obj;
+    callee->obj_ea = callee_ea;
+    callee->type = func_ptr_type;
+    callee->ea = ea;
+  }
+
+  cexpr_t *call = new cexpr_t();
+  call->op = cot_call;
+  call->x = callee;
+  call->a = new carglist_t();
+  call->a->functype = func_type;
+  if ( is_external_helper )
+    call->a->flags |= CFL_HELPER;
+  call->type = ret_type;
+  call->ea = ea;
+
+  auto append_arg = [&](cexpr_t *arg, int argnum)
+  {
+    tinfo_t formal_type = func_type.get_nth_arg(argnum);
+    carg_t &call_arg = call->a->push_back();
+    call_arg.consume_cexpr(arg);
+    call_arg.ea = ea;
+    call_arg.formal_type = formal_type;
+    return true;
+  };
+
+  if ( !append_arg(dst, 0) || !append_arg(src, 1) || !append_arg(size, 2) )
+  {
+    delete call;
+    return nullptr;
+  }
+  call->calc_type(true);
+  return call;
+}
+
 static cexpr_t *make_float_const_expr(float value, ea_t ea)
 {
   fpvalue_t fpval;
@@ -2150,6 +2483,586 @@ static cexpr_t *build_ps_lane_rewrite(const cexpr_t *dst_base, const cexpr_t *rh
   comma->ea = ea;
   comma->calc_type(true);
   return comma;
+}
+
+struct pointer_access_t
+{
+  var_ref_t var;
+  tinfo_t var_type;
+  int access_size = 0;
+  int embedded_advance = 0;
+};
+
+struct pointer_increment_t
+{
+  var_ref_t var;
+  int byte_delta = 0;
+};
+
+enum inline_copy_call_kind_t
+{
+  INLINE_COPY_CALL_NONE,
+  INLINE_COPY_CALL_MEMCPY,
+  INLINE_COPY_CALL_MEMMOVE,
+};
+
+struct inline_copy_loop_t
+{
+  var_ref_t src_var;
+  var_ref_t dst_var;
+  var_ref_t count_var;
+  tinfo_t src_ptr_type;
+  tinfo_t dst_ptr_type;
+  int width = 0;
+  int src_advance = 0;
+  int dst_advance = 0;
+};
+
+struct inline_copy_match_t
+{
+  cblock_t::iterator src_init_it;
+  cblock_t::iterator dst_init_it;
+  cblock_t::iterator count_init_it;
+  inline_copy_loop_t loop;
+  const cexpr_t *src_init_rhs = nullptr;
+  const cexpr_t *dst_init_rhs = nullptr;
+  const cexpr_t *count_init_rhs = nullptr;
+  cexpr_t *dst_arg = nullptr;
+  cexpr_t *src_arg = nullptr;
+  cexpr_t *size_arg = nullptr;
+  cexpr_t *call_expr = nullptr;
+  inline_copy_call_kind_t call_kind = INLINE_COPY_CALL_NONE;
+  ea_t ea = BADADDR;
+};
+
+static void cleanup_inline_copy_match(inline_copy_match_t *match)
+{
+  if ( match == nullptr )
+    return;
+  delete match->dst_arg;
+  delete match->src_arg;
+  delete match->size_arg;
+  delete match->call_expr;
+  match->dst_arg = nullptr;
+  match->src_arg = nullptr;
+  match->size_arg = nullptr;
+  match->call_expr = nullptr;
+}
+
+static bool item_has_label(const citem_t *item);
+
+static bool decode_pointer_access(pointer_access_t *out, const cexpr_t *expr)
+{
+  expr = skip_casts(expr);
+  if ( out == nullptr || expr == nullptr || expr->op != cot_ptr || expr->x == nullptr )
+    return false;
+  if ( expr->ptrsize != 1 && expr->ptrsize != 2 && expr->ptrsize != 4 && expr->ptrsize != 8 )
+    return false;
+
+  const cexpr_t *base = skip_casts(expr->x);
+  if ( base == nullptr )
+    return false;
+
+  int embedded_advance = 0;
+  const cexpr_t *var_expr = base;
+  if ( base->op == cot_preinc || base->op == cot_postinc || base->op == cot_predec || base->op == cot_postdec )
+  {
+    if ( base->x == nullptr )
+      return false;
+    var_expr = base->x;
+    embedded_advance = pointer_step_bytes(var_expr->type);
+    if ( embedded_advance <= 0 )
+      return false;
+    if ( base->op == cot_predec || base->op == cot_postdec )
+      embedded_advance = -embedded_advance;
+  }
+
+  if ( !get_var_ref(var_expr, &out->var) )
+    return false;
+
+  out->var_type = var_expr->type;
+  out->access_size = expr->ptrsize;
+  out->embedded_advance = embedded_advance;
+  return true;
+}
+
+static bool decode_pointer_increment(pointer_increment_t *out, const cexpr_t *expr)
+{
+  expr = skip_casts(expr);
+  if ( out == nullptr || expr == nullptr )
+    return false;
+
+  if ( expr->op == cot_preinc || expr->op == cot_postinc || expr->op == cot_predec || expr->op == cot_postdec )
+  {
+    if ( expr->x == nullptr || !get_var_ref(expr->x, &out->var) )
+      return false;
+    out->byte_delta = pointer_step_bytes(expr->x->type);
+    if ( expr->op == cot_predec || expr->op == cot_postdec )
+      out->byte_delta = -out->byte_delta;
+    return out->byte_delta != 0;
+  }
+
+  if ( (expr->op != cot_asgadd && expr->op != cot_asgsub)
+    || expr->x == nullptr
+    || expr->y == nullptr
+    || !get_var_ref(expr->x, &out->var) )
+  {
+    return false;
+  }
+
+  uint64 units = 0;
+  const cexpr_t *rhs = skip_casts(expr->y);
+  if ( rhs == nullptr || !rhs->get_const_value(&units) || units == 0 || units > uint64(INT_MAX) )
+    return false;
+
+  int scale = 1;
+  if ( expr->x->type.is_ptr() )
+  {
+    scale = pointer_step_bytes(expr->x->type, -1);
+    if ( scale <= 0 )
+      return false;
+  }
+
+  out->byte_delta = int(units) * scale;
+  if ( expr->op == cot_asgsub )
+    out->byte_delta = -out->byte_delta;
+  return out->byte_delta != 0;
+}
+
+static bool decode_inline_copy_loop(inline_copy_loop_t *out, const cinsn_t &ins)
+{
+  if ( out == nullptr || ins.op != cit_do || ins.cdo == nullptr || ins.cdo->body == nullptr )
+    return false;
+  if ( item_has_label(&ins) || item_has_label(ins.cdo->body) )
+    return false;
+  if ( !get_var_ref(&ins.cdo->expr, &out->count_var) )
+    return false;
+
+  cinsn_t *body = ins.cdo->body;
+  if ( body->op != cit_block || body->cblock == nullptr || body->cblock->size() < 2 || body->cblock->size() > 4 )
+    return false;
+
+  cblock_t::iterator last = body->cblock->end();
+  --last;
+  if ( last->op != cit_expr || last->cexpr == nullptr || last->cexpr->op != cot_predec || last->cexpr->x == nullptr )
+    return false;
+  if ( !is_var_expr(last->cexpr->x, out->count_var) )
+    return false;
+
+  qvector<pointer_increment_t> increments;
+  pointer_access_t dst_access;
+  pointer_access_t src_access;
+  bool seen_assign = false;
+
+  for ( cblock_t::iterator it = body->cblock->begin(); it != last; ++it )
+  {
+    if ( it->op != cit_expr || it->cexpr == nullptr )
+      return false;
+
+    cexpr_t *expr = it->cexpr;
+    if ( expr->op == cot_asg )
+    {
+      if ( seen_assign || expr->x == nullptr || expr->y == nullptr )
+        return false;
+      if ( !decode_pointer_access(&dst_access, expr->x) || !decode_pointer_access(&src_access, expr->y) )
+        return false;
+      if ( dst_access.access_size != src_access.access_size )
+        return false;
+      seen_assign = true;
+      continue;
+    }
+
+    if ( seen_assign )
+      return false;
+
+    pointer_increment_t inc;
+    if ( !decode_pointer_increment(&inc, expr) )
+      return false;
+    increments.push_back(inc);
+  }
+
+  if ( !seen_assign )
+    return false;
+  if ( same_var_ref(dst_access.var, src_access.var)
+    || same_var_ref(dst_access.var, out->count_var)
+    || same_var_ref(src_access.var, out->count_var) )
+  {
+    return false;
+  }
+
+  out->dst_var = dst_access.var;
+  out->src_var = src_access.var;
+  out->dst_ptr_type = dst_access.var_type;
+  out->src_ptr_type = src_access.var_type;
+  out->width = dst_access.access_size;
+  out->dst_advance = dst_access.embedded_advance;
+  out->src_advance = src_access.embedded_advance;
+
+  for ( const pointer_increment_t &inc : increments )
+  {
+    if ( same_var_ref(inc.var, out->dst_var) )
+      out->dst_advance += inc.byte_delta;
+    else if ( same_var_ref(inc.var, out->src_var) )
+      out->src_advance += inc.byte_delta;
+    else
+      return false;
+  }
+
+  return qabs(out->src_advance) == out->width
+      && out->src_advance == out->dst_advance;
+}
+
+static bool item_contains_var_ref(const citem_t *item, const var_ref_t &var)
+{
+  if ( item == nullptr )
+    return false;
+
+  struct ida_local var_ref_finder_t : public ctree_visitor_t
+  {
+    const var_ref_t &wanted;
+    bool found = false;
+
+    explicit var_ref_finder_t(const var_ref_t &v) : ctree_visitor_t(CV_FAST), wanted(v) {}
+
+    int idaapi visit_expr(cexpr_t *expr) override
+    {
+      if ( expr->op == cot_var && same_var_ref(expr->v, wanted) )
+      {
+        found = true;
+        return 1;
+      }
+      return 0;
+    }
+  };
+
+  var_ref_finder_t finder(var);
+  finder.apply_to_exprs(const_cast<citem_t *>(item), nullptr);
+  return finder.found;
+}
+
+static bool item_has_label(const citem_t *item)
+{
+  return item != nullptr && (item->label_num != -1 || item->contains_label());
+}
+
+static bool decode_var_init_stmt(const cinsn_t &ins, const var_ref_t &var, const cexpr_t **out_rhs)
+{
+  if ( ins.op != cit_expr || ins.cexpr == nullptr || ins.cexpr->op != cot_asg || ins.cexpr->x == nullptr || ins.cexpr->y == nullptr )
+    return false;
+  if ( !is_var_expr(ins.cexpr->x, var) || item_contains_var_ref(ins.cexpr->y, var) || ins.cexpr->y->has_side_effects() )
+    return false;
+  if ( out_rhs != nullptr )
+    *out_rhs = ins.cexpr->y;
+  return true;
+}
+
+static bool find_last_clean_var_init(
+        cblock_t *block,
+        cblock_t::iterator loop_it,
+        const var_ref_t &var,
+        cblock_t::iterator *out_it,
+        const cexpr_t **out_rhs)
+{
+  if ( block == nullptr || out_it == nullptr || out_rhs == nullptr )
+    return false;
+
+  cblock_t::iterator it = loop_it;
+  while ( it != block->begin() )
+  {
+    --it;
+    if ( !item_contains_var_ref(&*it, var) )
+      continue;
+    if ( !decode_var_init_stmt(*it, var, out_rhs) )
+      return false;
+    *out_it = it;
+    return true;
+  }
+  return false;
+}
+
+static bool vars_live_after_loop(
+        cblock_t *block,
+        cblock_t::iterator loop_it,
+        const var_ref_t &src_var,
+        const var_ref_t &dst_var,
+        const var_ref_t &count_var)
+{
+  if ( block == nullptr )
+    return true;
+
+  cblock_t::iterator it = loop_it;
+  ++it;
+  for ( ; it != block->end(); ++it )
+  {
+    if ( item_contains_var_ref(&*it, src_var)
+      || item_contains_var_ref(&*it, dst_var)
+      || item_contains_var_ref(&*it, count_var) )
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool match_inline_copy(
+        inline_copy_match_t *out,
+        cfunc_t *cfunc,
+        cblock_t *block,
+        cblock_t::iterator loop_it,
+        inline_copy_call_kind_t required_kind=INLINE_COPY_CALL_NONE)
+{
+  if ( out == nullptr || cfunc == nullptr || block == nullptr )
+    return false;
+  if ( loop_it->op != cit_do )
+    return false;
+
+  inline_copy_loop_t loop;
+  if ( !decode_inline_copy_loop(&loop, *loop_it)
+    || vars_live_after_loop(block, loop_it, loop.src_var, loop.dst_var, loop.count_var) )
+    return false;
+
+  const cexpr_t *src_init_rhs = nullptr;
+  const cexpr_t *dst_init_rhs = nullptr;
+  const cexpr_t *count_init_rhs = nullptr;
+  if ( !find_last_clean_var_init(block, loop_it, loop.src_var, &out->src_init_it, &src_init_rhs)
+    || !find_last_clean_var_init(block, loop_it, loop.dst_var, &out->dst_init_it, &dst_init_rhs)
+    || !find_last_clean_var_init(block, loop_it, loop.count_var, &out->count_init_it, &count_init_rhs) )
+    return false;
+
+  if ( out->src_init_it == out->dst_init_it
+    || out->src_init_it == out->count_init_it
+    || out->dst_init_it == out->count_init_it )
+    return false;
+  if ( item_has_label(&*out->src_init_it)
+    || item_has_label(&*out->dst_init_it)
+    || item_has_label(&*out->count_init_it) )
+    return false;
+
+  out->loop = loop;
+  out->src_init_rhs = src_init_rhs;
+  out->dst_init_rhs = dst_init_rhs;
+  out->count_init_rhs = count_init_rhs;
+  out->ea = loop_it->ea;
+
+  cexpr_t *copy_size = build_copy_size_expr(cfunc, count_init_rhs, loop.width, loop_it->ea);
+  if ( copy_size == nullptr )
+    return false;
+
+  int src_init_off = 0;
+  int dst_init_off = 0;
+  cexpr_t *src_start = nullptr;
+  cexpr_t *dst_start = nullptr;
+  inline_copy_call_kind_t call_kind = INLINE_COPY_CALL_NONE;
+
+  if ( loop.src_advance == loop.width && loop.dst_advance == loop.width )
+  {
+    src_start = build_copy_start_expr(cfunc, src_init_rhs, loop.src_ptr_type, loop.src_advance, loop_it->ea, &src_init_off);
+    dst_start = build_copy_start_expr(cfunc, dst_init_rhs, loop.dst_ptr_type, loop.dst_advance, loop_it->ea, &dst_init_off);
+    call_kind = (src_init_off == -loop.src_advance && dst_init_off == -loop.dst_advance)
+              ? INLINE_COPY_CALL_MEMMOVE
+              : INLINE_COPY_CALL_MEMCPY;
+  }
+  else if ( loop.src_advance == -loop.width && loop.dst_advance == -loop.width )
+  {
+    src_start = build_copy_base_from_end_expr(cfunc, src_init_rhs, count_init_rhs, loop.src_ptr_type, loop.width, loop_it->ea);
+    dst_start = build_copy_base_from_end_expr(cfunc, dst_init_rhs, count_init_rhs, loop.dst_ptr_type, loop.width, loop_it->ea);
+    call_kind = INLINE_COPY_CALL_MEMMOVE;
+  }
+
+  if ( src_start == nullptr || dst_start == nullptr || call_kind == INLINE_COPY_CALL_NONE )
+  {
+    delete src_start;
+    delete dst_start;
+    delete copy_size;
+    return false;
+  }
+
+  if ( required_kind != INLINE_COPY_CALL_NONE && call_kind != required_kind )
+  {
+    delete src_start;
+    delete dst_start;
+    delete copy_size;
+    return false;
+  }
+
+  out->dst_arg = dst_start;
+  out->src_arg = src_start;
+  out->size_arg = copy_size;
+
+  if ( call_kind == INLINE_COPY_CALL_MEMCPY )
+  {
+    out->call_expr = make_memory_copy_call_expr(
+            "memcpy",
+            "void *memcpy(void *, const void *, unsigned int);",
+            clone_expr(out->dst_arg),
+            clone_expr(out->src_arg),
+            clone_expr(out->size_arg),
+            loop_it->ea);
+  }
+  else
+  {
+    out->call_expr = make_memory_copy_call_expr(
+            "memmove",
+            "void *memmove(void *, const void *, unsigned int);",
+            clone_expr(out->dst_arg),
+            clone_expr(out->src_arg),
+            clone_expr(out->size_arg),
+            loop_it->ea);
+  }
+  if ( out->call_expr == nullptr )
+  {
+    cleanup_inline_copy_match(out);
+    return false;
+  }
+
+  out->call_kind = call_kind;
+  return true;
+}
+
+static bool match_inline_memmove_if(cexpr_t **out_call_expr, ea_t *out_ea, cfunc_t *cfunc, const cinsn_t &ins)
+{
+  if ( out_call_expr == nullptr || out_ea == nullptr || cfunc == nullptr || ins.op != cit_if || ins.cif == nullptr )
+    return false;
+  if ( ins.cif->ithen == nullptr || ins.cif->ielse == nullptr )
+    return false;
+  if ( ins.cif->ithen->op != cit_block || ins.cif->ithen->cblock == nullptr )
+    return false;
+  if ( ins.cif->ielse->op != cit_block || ins.cif->ielse->cblock == nullptr )
+    return false;
+  if ( ins.cif->ithen->cblock->empty() || ins.cif->ielse->cblock->empty() )
+    return false;
+
+  cblock_t::iterator then_loop_it = ins.cif->ithen->cblock->end();
+  cblock_t::iterator else_loop_it = ins.cif->ielse->cblock->end();
+  --then_loop_it;
+  --else_loop_it;
+
+  inline_copy_match_t then_match;
+  inline_copy_match_t else_match;
+  if ( !match_inline_copy(&then_match, cfunc, ins.cif->ithen->cblock, then_loop_it, INLINE_COPY_CALL_MEMMOVE)
+    || !match_inline_copy(&else_match, cfunc, ins.cif->ielse->cblock, else_loop_it, INLINE_COPY_CALL_MEMMOVE) )
+  {
+    cleanup_inline_copy_match(&then_match);
+    cleanup_inline_copy_match(&else_match);
+    return false;
+  }
+
+  if ( then_match.dst_arg == nullptr
+    || then_match.src_arg == nullptr
+    || then_match.size_arg == nullptr
+    || else_match.dst_arg == nullptr
+    || else_match.src_arg == nullptr
+    || else_match.size_arg == nullptr
+    || !same_effect_expr(then_match.dst_arg, else_match.dst_arg)
+    || !same_effect_expr(then_match.src_arg, else_match.src_arg)
+    || !same_effect_expr(then_match.size_arg, else_match.size_arg) )
+  {
+    cleanup_inline_copy_match(&then_match);
+    cleanup_inline_copy_match(&else_match);
+    return false;
+  }
+
+  delete then_match.dst_arg;
+  delete then_match.src_arg;
+  delete then_match.size_arg;
+  then_match.dst_arg = nullptr;
+  then_match.src_arg = nullptr;
+  then_match.size_arg = nullptr;
+  cleanup_inline_copy_match(&else_match);
+  *out_call_expr = then_match.call_expr;
+  *out_ea = ins.ea;
+  return true;
+}
+
+static void rewrite_inline_memmove_conditionals(cfunc_t *cfunc)
+{
+  bool changed = false;
+  do
+  {
+    struct ida_local inline_memmove_if_rewriter_t : public ctree_visitor_t
+    {
+      cfunc_t *cfunc = nullptr;
+      bool changed = false;
+
+      explicit inline_memmove_if_rewriter_t(cfunc_t *f) : ctree_visitor_t(CV_FAST | CV_INSNS | CV_POST), cfunc(f) {}
+
+      int idaapi leave_insn(cinsn_t *ins) override
+      {
+        if ( cfunc == nullptr || ins->op != cit_block || ins->cblock == nullptr )
+          return 0;
+
+        for ( cblock_t::iterator it = ins->cblock->begin(); it != ins->cblock->end(); ++it )
+        {
+          cexpr_t *call_expr = nullptr;
+          ea_t call_ea = BADADDR;
+          if ( !match_inline_memmove_if(&call_expr, &call_ea, cfunc, *it) )
+            continue;
+
+          it->cleanup();
+          it->op = cit_expr;
+          it->cexpr = call_expr;
+          it->ea = call_ea;
+          changed = true;
+          return 1;
+        }
+        return 0;
+      }
+    };
+
+    inline_memmove_if_rewriter_t rewriter(cfunc);
+    rewriter.apply_to(&cfunc->body, nullptr);
+    changed = rewriter.changed;
+  }
+  while ( changed );
+}
+
+static void rewrite_inline_copy_loops(cfunc_t *cfunc)
+{
+  bool changed = false;
+  do
+  {
+    struct ida_local inline_copy_rewriter_t : public ctree_visitor_t
+    {
+      cfunc_t *cfunc = nullptr;
+      bool changed = false;
+
+      explicit inline_copy_rewriter_t(cfunc_t *f) : ctree_visitor_t(CV_FAST | CV_INSNS | CV_POST), cfunc(f) {}
+
+      int idaapi leave_insn(cinsn_t *ins) override
+      {
+        if ( cfunc == nullptr || ins->op != cit_block || ins->cblock == nullptr )
+          return 0;
+
+        for ( cblock_t::iterator it = ins->cblock->begin(); it != ins->cblock->end(); )
+        {
+          cblock_t::iterator loop_it = it++;
+          inline_copy_match_t match;
+          if ( !match_inline_copy(&match, cfunc, ins->cblock, loop_it) )
+            continue;
+
+          cblock_t::iterator inserted = ins->cblock->insert(it);
+          inserted->op = cit_expr;
+          inserted->cexpr = match.call_expr;
+          inserted->ea = match.ea;
+          match.call_expr = nullptr;
+
+          ins->cblock->erase(loop_it);
+          ins->cblock->erase(match.src_init_it);
+          ins->cblock->erase(match.dst_init_it);
+          ins->cblock->erase(match.count_init_it);
+          cleanup_inline_copy_match(&match);
+          changed = true;
+          return 1;
+        }
+        return 0;
+      }
+    };
+
+    inline_copy_rewriter_t rewriter(cfunc);
+    rewriter.apply_to(&cfunc->body, nullptr);
+    changed = rewriter.changed;
+  }
+  while ( changed );
 }
 
 struct atomic_lwarx_dcbst_t
@@ -2656,7 +3569,7 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
   {
     if ( func_ea == BADADDR )
       return;
-    mark_cfunc_dirty(func_ea, true);
+    mark_cfunc_dirty(func_ea, false);
     if ( vu != nullptr )
       vu->refresh_view(true);
     else
@@ -2666,7 +3579,7 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
   void set_always_fix(bool enabled, vdui_t *vu=nullptr)
   {
     always_fix = enabled;
-    reg_write_bool(REG_ALWAYS_FIX, enabled, REG_SUBKEY);
+    save_always_fix_setting(enabled);
     update_action_checked(ALWAYS_FIX_ACTION_NAME, enabled);
 
     ea_t func_ea = BADADDR;
@@ -2690,6 +3603,8 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
       if ( mat == CMAT_FINAL && ctx->should_fix_function(cfunc->entry_ea) )
       {
         rewrite_ppc_atomic_update_loops(cfunc);
+        rewrite_inline_memmove_conditionals(cfunc);
+        rewrite_inline_copy_loops(cfunc);
         rewrite_ps_pair_assignments(cfunc);
       }
     }
@@ -2700,7 +3615,6 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
       vdui_t *vu = va_arg(va, vdui_t *);
       if ( vu != nullptr )
       {
-        attach_action_to_popup(widget, popup_handle, ALWAYS_FIX_ACTION_NAME, nullptr, SETMENU_APP);
         attach_action_to_popup(widget, popup_handle, TOGGLE_CONST_ACTION_NAME, nullptr, SETMENU_APP);
       }
     }
@@ -2709,7 +3623,7 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
 
   plugin_ctx_t()
   {
-    always_fix = reg_read_bool(REG_ALWAYS_FIX, true, REG_SUBKEY);
+    always_fix = load_always_fix_setting();
     filter.gate = this;
     always_fix_ah.ctx = this;
     ui_listener.ctx = this;
@@ -2723,13 +3637,15 @@ struct plugin_ctx_t : public plugmod_t, public event_listener_t, public ignore_m
     const_type_toggle.register_action();
     selection_mass_type.register_action();
 
-    register_action(ACTION_DESC_LITERAL(
+    register_action(ACTION_DESC_LITERAL_OWNER(
                             ALWAYS_FIX_ACTION_NAME,
                             "Always Fix Paired Singles In Functions",
                             &always_fix_ah,
+                            this,
                             nullptr,
                             "Automatically apply paired-single fixes to all decompiled functions",
-                            -1));
+                            -1,
+                            ADF_OT_PLUGMOD | ADF_CHECKABLE));
     update_action_checked(ALWAYS_FIX_ACTION_NAME, always_fix);
     msg("ida_gekko_pseudocode: installed optional Gekko pseudocode filter%s\n",
         always_fix ? " (automatic fixes enabled)" : "");
@@ -2817,15 +3733,23 @@ ssize_t idaapi ui_listener_t::on_event(ssize_t code, va_list va)
     {
       TWidget *widget = va_arg(va, TWidget *);
       TPopupMenu *popup_handle = va_arg(va, TPopupMenu *);
+      const action_activation_ctx_t *actx = va_arg(va, const action_activation_ctx_t *);
       if ( widget == nullptr || ctx == nullptr )
         return 0;
 
       const int widget_type = get_widget_type(widget);
-      if ( widget_type == BWN_DISASM && ctx->const_type_toggle.can_toggle(widget, widget_type) )
+      if ( widget_type == BWN_PSEUDOCODE )
+      {
+        attach_action_to_popup(widget, popup_handle, ALWAYS_FIX_ACTION_NAME, nullptr, SETMENU_APP);
+      }
+      const bool can_toggle_const = actx != nullptr
+                                  ? ctx->const_type_toggle.can_toggle(actx)
+                                  : ctx->const_type_toggle.can_toggle(widget, widget_type);
+      if ( widget_type == BWN_DISASM && can_toggle_const )
       {
         attach_action_to_popup(widget, popup_handle, TOGGLE_CONST_ACTION_NAME, nullptr, SETMENU_APP);
       }
-      else if ( widget_type == BWN_PSEUDOCODE && ctx->const_type_toggle.can_toggle(widget, widget_type) )
+      else if ( widget_type == BWN_PSEUDOCODE && can_toggle_const )
       {
         attach_action_to_popup(widget, popup_handle, TOGGLE_CONST_ACTION_NAME, nullptr, SETMENU_APP);
       }

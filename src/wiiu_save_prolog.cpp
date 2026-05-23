@@ -8,6 +8,8 @@
 namespace
 {
 
+constexpr bool DISABLE_WIIU_SAVE_PROLOG_FIX = false;
+
 static bool is_imm_value(const op_t &op, uval_t value)
 {
   return op.type == o_imm && op.value == value;
@@ -367,6 +369,9 @@ static bool find_wiiu_aligned_frame_setup_pattern(
 
 bool is_wiiu_save_prolog_insn(const insn_t &insn)
 {
+  if ( DISABLE_WIIU_SAVE_PROLOG_FIX )
+    return false;
+
   qvector<insn_t> insns;
   if ( collect_wiiu_save_prolog(&insns, insn.ea) )
   {
@@ -388,6 +393,9 @@ bool is_wiiu_save_prolog_insn(const insn_t &insn)
 
 void mark_wiiu_save_prolog_insns(ignore_micro_t *ignore, ea_t func_ea)
 {
+  if ( DISABLE_WIIU_SAVE_PROLOG_FIX || ignore == nullptr )
+    return;
+
   qvector<insn_t> insns;
   if ( !collect_wiiu_save_prolog(&insns, func_ea) )
     return;

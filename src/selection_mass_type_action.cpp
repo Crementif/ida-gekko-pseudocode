@@ -12,6 +12,7 @@
 #include <kernwin.hpp>
 #include <loader.hpp>
 #include <nalt.hpp>
+#include <segment.hpp>
 #include <typeinf.hpp>
 
 namespace
@@ -42,9 +43,20 @@ struct search_pattern_t
 struct apply_stats_t
 {
   size_t match_count = 0;
+  size_t candidate_count = 0;
   size_t applied_count = 0;
   size_t skipped_count = 0;
+  size_t alignment_skipped_count = 0;
+  size_t declined_count = 0;
+  size_t cancelled_count = 0;
   size_t failed_count = 0;
+};
+
+struct section_stats_t
+{
+  qstring name;
+  apply_stats_t stats;
+  qvector<ea_t> candidate_eas;
 };
 
 struct parsed_input_t
@@ -471,6 +483,50 @@ static bool parse_search_pattern(search_pattern_t *out, const qstring &text, qst
   return extract_compiled_pattern_size(&out->item_size, out->patterns, out_error);
 }
 
+static bool is_required_alignment_match(ea_t ea)
+{
+  return (ea & 0x3) == 0;
+}
+
+static qstring get_section_name(ea_t ea)
+{
+  segment_t *seg = getseg(ea);
+  if ( seg == nullptr )
+    return "<no segment>";
+
+  qstring name;
+  if ( get_visible_segm_name(&name, seg) > 0 && !name.empty() )
+    return name;
+  if ( get_segm_name(&name, seg) > 0 && !name.empty() )
+    return name;
+  return "<unnamed segment>";
+}
+
+static section_stats_t *get_or_create_section_stats(qvector<section_stats_t> *sections, ea_t ea)
+{
+  if ( sections == nullptr )
+    return nullptr;
+
+  const qstring name = get_section_name(ea);
+  for ( section_stats_t &section : *sections )
+  {
+    if ( section.name == name )
+      return &section;
+  }
+
+  section_stats_t &section = sections->push_back();
+  section.name = name;
+  return &section;
+}
+
+static void increment_stat(size_t apply_stats_t::*field, apply_stats_t *total, apply_stats_t *section)
+{
+  if ( total != nullptr )
+    ++(total->*field);
+  if ( section != nullptr )
+    ++(section->*field);
+}
+
 static bool is_safe_untyped_match(ea_t ea, asize_t size)
 {
   const ea_t max_ea = inf_get_max_ea();
@@ -531,11 +587,11 @@ static bool apply_mass_type(ea_t ea, const parsed_input_t &parsed, qstring *out_
   return true;
 }
 
-static void apply_mass_type_to_search_matches(
+static void collect_search_matches(
         apply_stats_t *stats,
+        qvector<section_stats_t> *sections,
         const search_pattern_t &pattern,
-        const parsed_input_t &parsed,
-        qstring *out_first_error)
+        asize_t item_size)
 {
   if ( stats == nullptr )
     return;
@@ -543,7 +599,7 @@ static void apply_mass_type_to_search_matches(
   *stats = apply_stats_t();
   const ea_t max_ea = inf_get_max_ea();
   ea_t cursor = inf_get_min_ea();
-  const asize_t step = parsed.item_size > 0 ? parsed.item_size : 1;
+  const asize_t step = item_size > 0 ? item_size : 1;
 
   while ( cursor < max_ea )
   {
@@ -554,24 +610,24 @@ static void apply_mass_type_to_search_matches(
     if ( match_ea == BADADDR )
       break;
 
-    ++stats->match_count;
-    if ( is_safe_untyped_match(match_ea, parsed.item_size) )
+    section_stats_t *section = get_or_create_section_stats(sections, match_ea);
+    apply_stats_t *section_stats = section != nullptr ? &section->stats : nullptr;
+    increment_stat(&apply_stats_t::match_count, stats, section_stats);
+
+    if ( !is_required_alignment_match(match_ea) )
     {
-      qstring error;
-      if ( apply_mass_type(match_ea, parsed, &error) )
-      {
-        ++stats->applied_count;
-      }
-      else
-      {
-        ++stats->failed_count;
-        if ( out_first_error != nullptr && out_first_error->empty() )
-          *out_first_error = error;
-      }
+      increment_stat(&apply_stats_t::alignment_skipped_count, stats, section_stats);
+      increment_stat(&apply_stats_t::skipped_count, stats, section_stats);
+    }
+    else if ( is_safe_untyped_match(match_ea, item_size) )
+    {
+      if ( section != nullptr )
+        section->candidate_eas.push_back(match_ea);
+      increment_stat(&apply_stats_t::candidate_count, stats, section_stats);
     }
     else
     {
-      ++stats->skipped_count;
+      increment_stat(&apply_stats_t::skipped_count, stats, section_stats);
     }
 
     const ea_t next_ea = match_ea + step;
@@ -579,6 +635,111 @@ static void apply_mass_type_to_search_matches(
       break;
     cursor = next_ea;
   }
+}
+
+static int confirm_section_apply(const section_stats_t &section, const qstring &search_input, const qstring &type_input)
+{
+  const uint64 candidate_count = uint64(section.candidate_eas.size());
+  if ( candidate_count == 0 )
+    return ASKBTN_NO;
+
+  qstring prompt;
+  if ( candidate_count == 1 )
+  {
+    prompt.sprnt("Section [%s]\n"
+                 "Search: %s\n"
+                 "Type: %s\n"
+                 "Eligible matches: %llu\n"
+                 "Only match: %a\n"
+                 "Skipped before apply: %llu (%llu due to 0x04 alignment)\n"
+                 "Apply to this section?",
+                 section.name.c_str(),
+                 search_input.c_str(),
+                 type_input.c_str(),
+                 candidate_count,
+                 section.candidate_eas[0],
+                 uint64(section.stats.skipped_count),
+                 uint64(section.stats.alignment_skipped_count));
+  }
+  else
+  {
+    prompt.sprnt("Section [%s]\n"
+                 "Search: %s\n"
+                 "Type: %s\n"
+                 "Eligible matches: %llu\n"
+                 "First/last eligible: %a .. %a\n"
+                 "Skipped before apply: %llu (%llu due to 0x04 alignment)\n"
+                 "Apply to this section?",
+                 section.name.c_str(),
+                 search_input.c_str(),
+                 type_input.c_str(),
+                 candidate_count,
+                 section.candidate_eas.front(),
+                 section.candidate_eas.back(),
+                 uint64(section.stats.skipped_count),
+                 uint64(section.stats.alignment_skipped_count));
+  }
+
+  return ask_yn(ASKBTN_YES, "%s", prompt.c_str());
+}
+
+static bool confirm_and_apply_section_matches(
+        apply_stats_t *stats,
+        qvector<section_stats_t> *sections,
+        const parsed_input_t &parsed,
+        const qstring &search_input,
+        const qstring &type_input,
+        qstring *out_first_error)
+{
+  if ( stats == nullptr || sections == nullptr )
+    return false;
+
+  for ( size_t i = 0; i < sections->size(); ++i )
+  {
+    section_stats_t &section = sections->at(i);
+    const size_t candidate_count = section.candidate_eas.size();
+    if ( candidate_count == 0 )
+      continue;
+
+    const int answer = confirm_section_apply(section, search_input, type_input);
+    if ( answer == ASKBTN_CANCEL )
+    {
+      for ( size_t j = i; j < sections->size(); ++j )
+      {
+        section_stats_t &remaining = sections->at(j);
+        const size_t cancelled_count = remaining.candidate_eas.size();
+        remaining.stats.cancelled_count += cancelled_count;
+        stats->cancelled_count += cancelled_count;
+      }
+      return false;
+    }
+
+    if ( answer == ASKBTN_NO )
+    {
+      section.stats.declined_count += candidate_count;
+      stats->declined_count += candidate_count;
+      continue;
+    }
+
+    for ( ea_t ea : section.candidate_eas )
+    {
+      qstring error;
+      if ( apply_mass_type(ea, parsed, &error) )
+      {
+        ++section.stats.applied_count;
+        ++stats->applied_count;
+      }
+      else
+      {
+        ++section.stats.failed_count;
+        ++stats->failed_count;
+        if ( out_first_error != nullptr && out_first_error->empty() )
+          *out_first_error = error;
+      }
+    }
+  }
+
+  return true;
 }
 
 struct selection_mass_type_handler_t : public action_handler_t
@@ -597,7 +758,7 @@ struct selection_mass_type_handler_t : public action_handler_t
     if ( !ask_str(&search_input,
                   HIST_SRCH,
                   "Search for bytes or a typed scalar like '.float 1.0'.\n"
-                  "All exact untyped matches will receive the type from the next prompt.") )
+                  "Eligible 0x04-aligned untyped matches will be grouped and confirmed per section.") )
     {
       return 0;
     }
@@ -641,8 +802,9 @@ struct selection_mass_type_handler_t : public action_handler_t
     }
 
     apply_stats_t stats;
+    qvector<section_stats_t> sections;
     qstring first_error;
-    apply_mass_type_to_search_matches(&stats, pattern, parsed, &first_error);
+    collect_search_matches(&stats, &sections, pattern, parsed.item_size);
 
     if ( stats.match_count == 0 )
     {
@@ -650,20 +812,71 @@ struct selection_mass_type_handler_t : public action_handler_t
       return 0;
     }
 
+    if ( stats.candidate_count == 0 )
+    {
+      msg("ida_gekko_pseudocode: search '%s' -> no eligible matches; skipped %llu/%llu (%llu due to 0x04 alignment)\n",
+          search_input.c_str(),
+          uint64(stats.skipped_count),
+          uint64(stats.match_count),
+          uint64(stats.alignment_skipped_count));
+      for ( const section_stats_t &section : sections )
+      {
+        if ( section.stats.match_count == 0 )
+          continue;
+        msg("ida_gekko_pseudocode:   [%s] eligible %llu/%llu; skipped %llu (%llu due to 0x04 alignment)\n",
+            section.name.c_str(),
+            uint64(section.stats.candidate_count),
+            uint64(section.stats.match_count),
+            uint64(section.stats.skipped_count),
+            uint64(section.stats.alignment_skipped_count));
+      }
+      warning("ida_gekko_pseudocode: found matches for '%s', but none were 0x04-aligned untyped item starts", search_input.c_str());
+      return 0;
+    }
+
+    const bool completed = confirm_and_apply_section_matches(&stats,
+                                                             &sections,
+                                                             parsed,
+                                                             search_input,
+                                                             type_input,
+                                                             &first_error);
+
     if ( stats.applied_count != 0 )
       refresh_idaview_anyway();
 
-    msg("ida_gekko_pseudocode: search '%s' -> applied '%s' to %llu/%llu matches; skipped %llu, failures %llu\n",
+    msg("ida_gekko_pseudocode: search '%s' -> eligible %llu/%llu matches; applied %llu, declined %llu, cancelled %llu, skipped %llu (%llu due to 0x04 alignment), failures %llu\n",
         search_input.c_str(),
-        type_input.c_str(),
-        uint64(stats.applied_count),
+        uint64(stats.candidate_count),
         uint64(stats.match_count),
+        uint64(stats.applied_count),
+        uint64(stats.declined_count),
+        uint64(stats.cancelled_count),
         uint64(stats.skipped_count),
+        uint64(stats.alignment_skipped_count),
         uint64(stats.failed_count));
+
+    for ( const section_stats_t &section : sections )
+    {
+      if ( section.stats.match_count == 0 )
+        continue;
+      msg("ida_gekko_pseudocode:   [%s] eligible %llu/%llu; applied %llu, declined %llu, cancelled %llu, skipped %llu (%llu due to 0x04 alignment), failures %llu\n",
+          section.name.c_str(),
+          uint64(section.stats.candidate_count),
+          uint64(section.stats.match_count),
+          uint64(section.stats.applied_count),
+          uint64(section.stats.declined_count),
+          uint64(section.stats.cancelled_count),
+          uint64(section.stats.skipped_count),
+          uint64(section.stats.alignment_skipped_count),
+          uint64(section.stats.failed_count));
+    }
+
+    if ( !completed )
+      warning("ida_gekko_pseudocode: cancelled while confirming sections for '%s'", search_input.c_str());
 
     if ( stats.applied_count == 0 )
     {
-      warning("ida_gekko_pseudocode: found matches for '%s', but none were untyped item starts", search_input.c_str());
+      warning("ida_gekko_pseudocode: no section was applied for '%s'", search_input.c_str());
       return 0;
     }
 
