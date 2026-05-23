@@ -2081,6 +2081,147 @@ static bool split_pointer_base_offset(const cexpr_t **out_base, int *out_byte_of
   return true;
 }
 
+static cexpr_t *make_lvar_expr(cfunc_t *cfunc, const lvar_t &lv, ea_t ea)
+{
+  lvars_t *lvars = cfunc != nullptr ? cfunc->get_lvars() : nullptr;
+  if ( cfunc == nullptr || cfunc->mba == nullptr || lvars == nullptr )
+    return nullptr;
+
+  int idx = -1;
+  for ( int i = 0; i < lvars->size(); ++i )
+  {
+    if ( &(*lvars)[i] == &lv )
+    {
+      idx = i;
+      break;
+    }
+  }
+  if ( idx < 0 )
+    return nullptr;
+
+  cexpr_t *expr = new cexpr_t();
+  expr->op = cot_var;
+  expr->v.mba = cfunc->mba;
+  expr->v.idx = idx;
+  expr->refwidth = lv.width;
+  expr->type = lv.tif;
+  expr->ea = ea;
+  return expr;
+}
+
+static bool extract_stack_address_lvar(const cexpr_t *expr, const lvar_t **out_lv)
+{
+  if ( out_lv == nullptr )
+    return false;
+
+  expr = skip_casts(expr);
+  if ( expr == nullptr )
+    return false;
+
+  const cexpr_t *var_expr = nullptr;
+  if ( expr->op == cot_ref && expr->x != nullptr )
+  {
+    var_expr = skip_casts(expr->x);
+  }
+  else if ( expr->op == cot_var )
+  {
+    const lvar_t &lv = expr->v.getv();
+    if ( !lv.tif.is_array() )
+      return false;
+    var_expr = expr;
+  }
+  else
+  {
+    return false;
+  }
+
+  if ( var_expr == nullptr || var_expr->op != cot_var )
+    return false;
+
+  const lvar_t &lv = var_expr->v.getv();
+  if ( !lv.is_stk_var() )
+    return false;
+
+  *out_lv = &lv;
+  return true;
+}
+
+static int score_stack_pointer_lvar(const lvar_t &lv)
+{
+  int score = 0;
+  if ( lv.tif.is_array() )
+    score += 16;
+  else if ( lv.tif.is_udt() )
+    score += 8;
+  else if ( lv.width > 1 )
+    score += 4;
+  if ( !lv.is_arg_var() )
+    score += 4;
+  if ( lv.is_used_byref() )
+    score += 2;
+  if ( !lv.has_regname() )
+    score += 1;
+  if ( lv.is_overlapped_var() )
+    score -= 4;
+  return score;
+}
+
+static const lvar_t *find_best_stack_lvar_at_offset(cfunc_t *cfunc, sval_t stkoff)
+{
+  lvars_t *lvars = cfunc != nullptr ? cfunc->get_lvars() : nullptr;
+  if ( lvars == nullptr )
+    return nullptr;
+
+  const lvar_t *best = nullptr;
+  int best_score = 0;
+  for ( lvar_t &lv : *lvars )
+  {
+    if ( !lv.is_stk_var() || lv.get_stkoff() != stkoff )
+      continue;
+
+    const int score = score_stack_pointer_lvar(lv);
+    if ( best == nullptr || score > best_score )
+    {
+      best = &lv;
+      best_score = score;
+    }
+  }
+
+  return best;
+}
+
+static cexpr_t *build_stack_lvar_address_expr(cfunc_t *cfunc, const lvar_t &lv, ea_t ea)
+{
+  cexpr_t *var_expr = make_lvar_expr(cfunc, lv, ea);
+  if ( var_expr == nullptr )
+    return nullptr;
+  if ( lv.tif.is_array() )
+    return var_expr;
+
+  cexpr_t *ref_expr = new cexpr_t(cot_ref, var_expr);
+  ref_expr->ea = ea;
+  ref_expr->calc_type(true);
+  return ref_expr;
+}
+
+static cexpr_t *try_build_stack_pointer_expr(
+        cfunc_t *cfunc,
+        const cexpr_t *base,
+        int byte_off,
+        ea_t ea)
+{
+  const lvar_t *base_lv = nullptr;
+  if ( !extract_stack_address_lvar(base, &base_lv) || base_lv == nullptr )
+    return nullptr;
+
+  const sval_t target_off = base_lv->get_stkoff() + byte_off;
+  const lvar_t *target_lv = find_best_stack_lvar_at_offset(cfunc, target_off);
+  if ( target_lv == nullptr )
+    return nullptr;
+
+  return build_stack_lvar_address_expr(cfunc, *target_lv, ea);
+}
+
 static cexpr_t *build_pointer_offset_expr(
         cfunc_t *cfunc,
         const cexpr_t *base,
@@ -2088,6 +2229,9 @@ static cexpr_t *build_pointer_offset_expr(
         int byte_off,
         ea_t ea)
 {
+  if ( cexpr_t *stack_expr = try_build_stack_pointer_expr(cfunc, base, byte_off, ea) )
+    return stack_expr;
+
   cexpr_t *expr = clone_expr(base);
   if ( expr == nullptr )
     return nullptr;
@@ -2189,13 +2333,12 @@ static cexpr_t *build_copy_base_from_end_expr(
     if ( same_effect_expr(expr->y, scaled_count) )
     {
       delete scaled_count;
-      return clone_expr(expr->x);
+      return build_pointer_offset_expr(cfunc, expr->x, ptr_type, 0, ea);
     }
     if ( same_effect_expr(expr->x, scaled_count) )
     {
-      cexpr_t *base = clone_expr(expr->y);
       delete scaled_count;
-      return base;
+      return build_pointer_offset_expr(cfunc, expr->y, ptr_type, 0, ea);
     }
   }
 
@@ -2226,6 +2369,22 @@ static bool make_memory_copy_types(
   return true;
 }
 
+static ea_t find_external_name_ea(const char *name)
+{
+  if ( name == nullptr || *name == '\0' )
+    return BADADDR;
+
+  const ea_t ea = get_name_ea(BADADDR, name);
+  if ( ea == BADADDR )
+    return BADADDR;
+
+  const segment_t *seg = getseg(ea);
+  if ( seg == nullptr || seg->type != SEG_XTRN )
+    return BADADDR;
+
+  return ea;
+}
+
 static cexpr_t *make_memory_copy_call_expr(
         const char *name,
         const char *decl,
@@ -2254,9 +2413,9 @@ static cexpr_t *make_memory_copy_call_expr(
   }
 
   cexpr_t *callee = new cexpr_t();
-  const ea_t callee_ea = get_name_ea(BADADDR, name);
-  const bool is_external_helper = callee_ea == BADADDR;
-  if ( callee_ea == BADADDR )
+  const ea_t callee_ea = find_external_name_ea(name);
+  const bool is_helper = callee_ea == BADADDR;
+  if ( is_helper )
   {
     callee->op = cot_helper;
     callee->helper = qstrdup(name);
@@ -2276,7 +2435,7 @@ static cexpr_t *make_memory_copy_call_expr(
   call->x = callee;
   call->a = new carglist_t();
   call->a->functype = func_type;
-  if ( is_external_helper )
+  if ( is_helper )
     call->a->flags |= CFL_HELPER;
   call->type = ret_type;
   call->ea = ea;
