@@ -2109,41 +2109,59 @@ static cexpr_t *make_lvar_expr(cfunc_t *cfunc, const lvar_t &lv, ea_t ea)
   return expr;
 }
 
-static bool extract_stack_address_lvar(const cexpr_t *expr, const lvar_t **out_lv)
+static bool extract_stack_lvalue_stkoff(const cexpr_t *expr, sval_t *out_stkoff)
 {
-  if ( out_lv == nullptr )
+  if ( out_stkoff == nullptr )
     return false;
 
   expr = skip_casts(expr);
   if ( expr == nullptr )
     return false;
 
-  const cexpr_t *var_expr = nullptr;
-  if ( expr->op == cot_ref && expr->x != nullptr )
-  {
-    var_expr = skip_casts(expr->x);
-  }
-  else if ( expr->op == cot_var )
+  if ( expr->op == cot_var )
   {
     const lvar_t &lv = expr->v.getv();
-    if ( !lv.tif.is_array() )
+    if ( !lv.is_stk_var() )
       return false;
-    var_expr = expr;
+    *out_stkoff = lv.get_stkoff();
+    return true;
   }
-  else
+
+  if ( expr->op == cot_memref && expr->x != nullptr )
   {
-    return false;
+    sval_t base_off = 0;
+    if ( !extract_stack_lvalue_stkoff(expr->x, &base_off) )
+      return false;
+    *out_stkoff = base_off + sval_t(expr->m);
+    return true;
   }
 
-  if ( var_expr == nullptr || var_expr->op != cot_var )
+  return false;
+}
+
+static bool extract_stack_address_stkoff(const cexpr_t *expr, sval_t *out_stkoff)
+{
+  if ( out_stkoff == nullptr )
     return false;
 
-  const lvar_t &lv = var_expr->v.getv();
-  if ( !lv.is_stk_var() )
+  expr = skip_casts(expr);
+  if ( expr == nullptr )
     return false;
+  if ( expr->op == cot_ref && expr->x != nullptr )
+  {
+    return extract_stack_lvalue_stkoff(expr->x, out_stkoff);
+  }
 
-  *out_lv = &lv;
-  return true;
+  if ( expr->op == cot_var )
+  {
+    const lvar_t &lv = expr->v.getv();
+    if ( !lv.is_stk_var() || !lv.tif.is_array() )
+      return false;
+    *out_stkoff = lv.get_stkoff();
+    return true;
+  }
+
+  return false;
 }
 
 static int score_stack_pointer_lvar(const lvar_t &lv)
@@ -2210,11 +2228,11 @@ static cexpr_t *try_build_stack_pointer_expr(
         int byte_off,
         ea_t ea)
 {
-  const lvar_t *base_lv = nullptr;
-  if ( !extract_stack_address_lvar(base, &base_lv) || base_lv == nullptr )
+  sval_t base_off = 0;
+  if ( !extract_stack_address_stkoff(base, &base_off) )
     return nullptr;
 
-  const sval_t target_off = base_lv->get_stkoff() + byte_off;
+  const sval_t target_off = base_off + byte_off;
   const lvar_t *target_lv = find_best_stack_lvar_at_offset(cfunc, target_off);
   if ( target_lv == nullptr )
     return nullptr;
@@ -2227,10 +2245,121 @@ static cexpr_t *build_pointer_offset_expr(
         const cexpr_t *base,
         const tinfo_t &ptr_type,
         int byte_off,
+        ea_t ea);
+
+static bool get_signed_const_value(const cexpr_t *expr, int64 *out_value)
+{
+  if ( out_value == nullptr )
+    return false;
+
+  expr = skip_casts(expr);
+  if ( expr == nullptr || expr->op != cot_num )
+    return false;
+
+  *out_value = int64(expr->numval());
+  return true;
+}
+
+static cexpr_t *try_build_container_pointer_expr(
+        cfunc_t *cfunc,
+        const cexpr_t *base,
+        int byte_off,
+        ea_t ea)
+{
+  base = skip_casts(base);
+  if ( base == nullptr || base->op != cot_ref || base->x == nullptr )
+    return nullptr;
+
+  const cexpr_t *lvalue = skip_casts(base->x);
+  if ( lvalue == nullptr )
+    return nullptr;
+
+  const cexpr_t *pointer_expr = nullptr;
+  tinfo_t container_type;
+  int member_off = 0;
+  int64 container_index_units = 0;
+  bool have_container_index = false;
+  if ( lvalue->op == cot_memref && lvalue->x != nullptr )
+  {
+    const cexpr_t *container_lvalue = skip_casts(lvalue->x);
+    if ( container_lvalue == nullptr )
+      return nullptr;
+    container_type = container_lvalue->type;
+    member_off = int(lvalue->m);
+
+    if ( container_lvalue->op == cot_ptr && container_lvalue->x != nullptr )
+      pointer_expr = skip_casts(container_lvalue->x);
+    else if ( container_lvalue->op == cot_idx
+           && container_lvalue->x != nullptr
+           && container_lvalue->y != nullptr )
+    {
+      pointer_expr = skip_casts(container_lvalue->x);
+      if ( !get_signed_const_value(container_lvalue->y, &container_index_units) )
+        return nullptr;
+      have_container_index = true;
+    }
+  }
+  else if ( lvalue->op == cot_memptr && lvalue->x != nullptr )
+  {
+    pointer_expr = skip_casts(lvalue->x);
+    if ( pointer_expr == nullptr || !pointer_expr->type.is_ptr() )
+      return nullptr;
+    container_type = remove_pointer(pointer_expr->type);
+    member_off = int(lvalue->m);
+  }
+  else
+  {
+    return nullptr;
+  }
+
+  const size_t obj_size = container_type.get_size();
+  if ( pointer_expr == nullptr
+    || !pointer_expr->type.is_ptr()
+    || obj_size == BADSIZE
+    || obj_size == 0
+    || obj_size > size_t(INT_MAX) )
+  {
+    return nullptr;
+  }
+
+  const int total_off = member_off + byte_off;
+  const int obj_size_int = int(obj_size);
+  if ( total_off % obj_size_int != 0 )
+    return nullptr;
+
+  int container_index_byte_off = 0;
+  if ( have_container_index )
+  {
+    const int64 index_byte_off = container_index_units * int64(obj_size_int);
+    if ( index_byte_off < INT_MIN || index_byte_off > INT_MAX )
+      return nullptr;
+    container_index_byte_off = int(index_byte_off);
+  }
+
+  const cexpr_t *ptr_base = nullptr;
+  int ptr_byte_off = 0;
+  if ( !split_pointer_base_offset(&ptr_base, &ptr_byte_off, pointer_expr) )
+    return nullptr;
+
+  return build_pointer_offset_expr(
+          cfunc,
+          ptr_base,
+          pointer_expr->type,
+          ptr_byte_off + container_index_byte_off + total_off,
+          ea);
+}
+
+static cexpr_t *build_pointer_offset_expr(
+        cfunc_t *cfunc,
+        const cexpr_t *base,
+        const tinfo_t &ptr_type,
+        int byte_off,
         ea_t ea)
 {
   if ( cexpr_t *stack_expr = try_build_stack_pointer_expr(cfunc, base, byte_off, ea) )
     return stack_expr;
+  if ( cexpr_t *container_expr = try_build_container_pointer_expr(cfunc, base, byte_off, ea) )
+    return container_expr;
 
   cexpr_t *expr = clone_expr(base);
   if ( expr == nullptr )
